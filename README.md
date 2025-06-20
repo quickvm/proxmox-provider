@@ -1,6 +1,6 @@
 # QuickVM Proxmox Provider
 
-The QuickVM Proxmox Provider enables your Proxmox VE host to work as a provider for the QuickVM service. This script automates the setup of an LXC container running the QuickVM provider service, complete with proper API authentication and resource management.
+The QuickVM Proxmox Provider enables your Proxmox VE host to work as a provider for the QuickVM service. This script automates the setup of an LXC container running the QuickVM provider service.
 
 ## Overview
 
@@ -10,7 +10,13 @@ The QuickVM Proxmox Provider:
 - Configures Proxmox API users and permissions for VM management
 - Provides secure API access for VM lifecycle operations
 - Supports both DHCP and static IP configuration
-- Includes automatic template download and resource allocation
+- Includes automatic LXC template download and resource allocation
+
+## But why?
+
+While Proxmox VE offers comprehensive VM and container management capabilities, it lacks a dedicated API for programmatic snippet management. This provider bridges that functionality gap, so QuickVM can provision Fedora CoreOS to your Proxmox cluster. It was either this or doing snippit uploads via SSH... we all know we don't want that.
+
+We also wanted to have a quick way to create an API user that we can use to configure a Proxmox provider in QuickVM. This provider installer does that too.
 
 ## Prerequisites
 
@@ -30,11 +36,11 @@ The script requires the following Proxmox tools (typically pre-installed):
 
 ### Quick Start (Recommended)
 
-For most installations, simply run the script with default settings:
+For most installations, simply run the script with default settings as the root user on your Proxmox cluster:
 
 ```bash
 # Download and make executable
-wget https://your-repo/quickvm-proxmox-provider.sh
+wget https://raw.githubusercontent.com/quickvm/proxmox-provider/refs/heads/master/quickvm-proxmox-provider.sh
 chmod +x quickvm-proxmox-provider.sh
 
 # Run with defaults (auto-detects storage, uses DHCP)
