@@ -40,10 +40,11 @@ TEMPLATE_STORAGE=${TEMPLATE_STORAGE:-""}
 IP_ADDRESS=${IP:-""}
 GATEWAY=${GATEWAY:-""}
 DEBUG_MODE=${DEBUG:-false}
-IMAGE_TAG=${TAG:-"sha-0760b32"}
+IMAGE_TAG=${TAG:-"stable"}
 CONTAINER_ID_MANUAL=""
 CONFIG_FILE="/etc/quickvm/quickvm-provider.env"
 SKIP_API_USER=${SKIP_API_USER:-false}
+AUTO_UPDATE=${AUTO_UPDATE:-false}
 
 # API key handling
 if [[ -z "${API_KEY:-}" ]]; then
