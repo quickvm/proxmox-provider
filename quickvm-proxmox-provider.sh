@@ -36,6 +36,7 @@ ROOTFS_SIZE=${ROOTFS_SIZE:-8}
 BRIDGE=${BRIDGE:-"vmbr0"}
 HOST_PORT=${HOST_PORT:-"8071"}
 STORAGE=${STORAGE:-""}
+TEMPLATE_STORAGE=${TEMPLATE_STORAGE:-""}
 IP_ADDRESS=${IP:-""}
 GATEWAY=${GATEWAY:-""}
 DEBUG_MODE=${DEBUG:-false}
@@ -111,6 +112,10 @@ parse_arguments() {
                 STORAGE="$2"
                 shift 2
                 ;;
+            -ts|--template-storage)
+                TEMPLATE_STORAGE="$2"
+                shift 2
+                ;;
             -i|--ip-address)
                 IP_ADDRESS="$2"
                 shift 2
@@ -122,6 +127,10 @@ parse_arguments() {
             --debug)
                 DEBUG_MODE=true
                 shift
+                ;;
+            --debug-storage)
+                show_storage_debug_info
+                exit 0
                 ;;
             -t|--tag)
                 IMAGE_TAG="$2"
@@ -243,23 +252,204 @@ validate_static_ip() {
     fi
 }
 
+# Check if storage supports specific content types
+check_storage_content_support() {
+    local storage_name="$1"
+    local required_content="$2"
+
+    # First check if storage is active using pvesm status
+    local storage_info=$(pvesm status | grep "^${storage_name}")
+    if [[ -z "${storage_info}" ]]; then
+        return 1  # Storage not found
+    fi
+
+    # Check if storage is active
+    if ! echo "${storage_info}" | grep -q "active"; then
+        return 1  # Storage not active
+    fi
+
+    # Parse /etc/pve/storage.cfg to get supported content types
+    if [[ ! -f "/etc/pve/storage.cfg" ]]; then
+        log_warning "Cannot find /etc/pve/storage.cfg, falling back to basic checks"
+        return 0  # Default to supported if we can't determine
+    fi
+
+            # Check if storage is disabled in config and get content types
+    local storage_block=$(awk -v storage="${storage_name}" '
+        /^[a-zA-Z]+: / {
+            # If we were processing a previous storage, output its result
+            if (current_storage && current_storage == storage) {
+                if (disabled) print "DISABLED"
+                else if (content) print content
+                else print "NO_CONTENT"
+                exit
+            }
+            # Start processing new storage
+            current_storage = $2
+            disabled = 0
+            content = ""
+        }
+        current_storage == storage && /^[[:space:]]*disable[[:space:]]*$/ {
+            disabled = 1
+        }
+        current_storage == storage && /^[[:space:]]*content[[:space:]]/ {
+            content = $0
+            gsub(/^[[:space:]]*content[[:space:]]*/, "", content)
+        }
+        END {
+            # Handle the last storage in the file
+            if (current_storage == storage) {
+                if (disabled) print "DISABLED"
+                else if (content) print content
+                else print "NO_CONTENT"
+            }
+        }
+    ' /etc/pve/storage.cfg)
+
+        if [[ "${storage_block}" == "DISABLED" ]]; then
+        return 1  # Storage is disabled
+    fi
+
+    if [[ -z "${storage_block}" || "${storage_block}" == "NO_CONTENT" ]]; then
+        log_warning "Could not find content configuration for storage '${storage_name}'"
+        return 1  # Fail if we can't determine (don't assume supported)
+    fi
+
+    # Check if the required content type is in the comma-separated list
+    if echo "${storage_block}" | grep -q "\b${required_content}\b"; then
+        return 0  # Content type is supported
+    else
+        return 1  # Content type is not supported
+    fi
+}
+
+# Show detailed storage information for debugging
+show_storage_debug_info() {
+    echo "=== Storage Configuration Debug Information ==="
+    echo ""
+
+    # Show pvesm status output
+    log_info "Active storage from 'pvesm status':"
+    pvesm status | grep "active" | while read -r line; do
+        local storage_name=$(echo "$line" | awk '{print $1}')
+        local storage_type=$(echo "$line" | awk '{print $2}')
+        local storage_avail=$(echo "$line" | awk '{print $6}')
+        echo "  ${storage_name} (${storage_type}) - Available: ${storage_avail}"
+    done
+    echo ""
+
+    # Show storage.cfg content types
+    if [[ -f "/etc/pve/storage.cfg" ]]; then
+                log_info "Storage content types from '/etc/pve/storage.cfg':"
+        awk '
+            /^[a-zA-Z]+: / {
+                # Output previous storage info
+                if (storage_name) {
+                    status = disabled ? " (DISABLED)" : ""
+                    printf "  %s: %s%s\n", storage_name, content ? content : "no content specified", status
+                }
+                # Start new storage
+                storage_type = $1
+                storage_name = $2
+                disabled = 0
+                content = ""
+            }
+                        /^[[:space:]]*disable[[:space:]]*$/ { disabled = 1 }
+            /^[[:space:]]*content[[:space:]]/ {
+                content = $0
+                gsub(/^[[:space:]]*content[[:space:]]*/, "", content)
+            }
+            END {
+                # Output the last storage
+                if (storage_name) {
+                    status = disabled ? " (DISABLED)" : ""
+                    printf "  %s: %s%s\n", storage_name, content ? content : "no content specified", status
+                }
+            }
+        ' /etc/pve/storage.cfg
+    else
+        log_warning "Cannot read /etc/pve/storage.cfg"
+    fi
+    echo ""
+
+    # Check specific content type support for active storage
+    log_info "Container support (rootdir) check:"
+    pvesm status | grep "active" | while read -r line; do
+        local storage_name=$(echo "$line" | awk '{print $1}')
+        if check_storage_content_support "${storage_name}" "rootdir"; then
+            echo "  ✓ ${storage_name} supports containers"
+        else
+            echo "  ✗ ${storage_name} does not support containers"
+        fi
+    done
+    echo ""
+
+    log_info "Template support (vztmpl) check:"
+    pvesm status | grep "active" | while read -r line; do
+        local storage_name=$(echo "$line" | awk '{print $1}')
+        if check_storage_content_support "${storage_name}" "vztmpl"; then
+            echo "  ✓ ${storage_name} supports templates"
+        else
+            echo "  ✗ ${storage_name} does not support templates"
+        fi
+    done
+    echo ""
+}
+
 # Detect and validate storage
 detect_storage() {
+    # Detect container storage
     if [[ -n "${STORAGE}" ]]; then
-        log_info "Using specified storage: ${STORAGE}"
+        log_info "Using specified container storage: ${STORAGE}"
 
         # Verify the storage exists and is active
         if ! pvesm status | grep -q "^${STORAGE}.*active"; then
-            log_error "Storage '${STORAGE}' is not found or not active"
+            log_error "Container storage '${STORAGE}' is not found or not active"
             log_info "Available active storage:"
             pvesm status | grep "active" | awk '{print "  " $1 " (" $2 ")"}'
             exit 1
         fi
-        return
+
+        # Check if storage supports containers (rootdir content)
+        if ! check_storage_content_support "${STORAGE}" "rootdir"; then
+            log_warning "Storage '${STORAGE}' may not support LXC containers"
+            log_info "This storage will be used anyway as explicitly specified"
+        fi
+    else
+        log_info "No container storage specified, detecting available storage..."
+        detect_container_storage
     fi
 
-    log_info "No storage specified, detecting available storage..."
+    # Detect template storage
+    if [[ -n "${TEMPLATE_STORAGE}" ]]; then
+        log_info "Using specified template storage: ${TEMPLATE_STORAGE}"
 
+        # Verify the storage exists and is active
+        if ! pvesm status | grep -q "^${TEMPLATE_STORAGE}.*active"; then
+            log_error "Template storage '${TEMPLATE_STORAGE}' is not found or not active"
+            log_info "Available active storage:"
+            pvesm status | grep "active" | awk '{print "  " $1 " (" $2 ")"}'
+            exit 1
+        fi
+
+        # Check if storage supports templates (vztmpl content)
+        if ! check_storage_content_support "${TEMPLATE_STORAGE}" "vztmpl"; then
+            log_error "Template storage '${TEMPLATE_STORAGE}' does not support LXC templates (vztmpl content)"
+            log_info "Please choose a different storage for templates or omit --template-storage to auto-detect"
+            exit 1
+        fi
+    else
+        log_info "No template storage specified, detecting available template storage..."
+        detect_template_storage
+    fi
+
+    log_success "Storage configuration:"
+    log_success "  Container storage: ${STORAGE}"
+    log_success "  Template storage: ${TEMPLATE_STORAGE}"
+}
+
+# Detect container storage
+detect_container_storage() {
     # Get list of active storage
     local active_storage=($(pvesm status | grep "active" | awk '{print $1}'))
 
@@ -268,18 +458,38 @@ detect_storage() {
         log_info "Available storage:"
         pvesm status | awk 'NR>1 {print "  " $1 " (" $2 ", " $3 ")"}'
         exit 1
-    elif [[ ${#active_storage[@]} -eq 1 ]]; then
-        STORAGE="${active_storage[0]}"
-        log_success "Auto-selected storage: ${STORAGE}"
-    else
-        log_error "Multiple active storage found. Please specify which one to use."
-        echo ""
-        log_info "Available active storage:"
+    fi
+
+    # Filter storage that supports containers
+    local container_storage=()
+    for storage in "${active_storage[@]}"; do
+        if check_storage_content_support "${storage}" "rootdir"; then
+            container_storage+=("${storage}")
+        fi
+    done
+
+    if [[ ${#container_storage[@]} -eq 0 ]]; then
+        log_error "No active storage found that supports LXC containers"
+        log_info "Available active storage (may not support containers):"
         for storage in "${active_storage[@]}"; do
             local storage_info=$(pvesm status | grep "^${storage}")
             local storage_type=$(echo "$storage_info" | awk '{print $2}')
-            local storage_total=$(echo "$storage_info" | awk '{print $4}')
-            local storage_used=$(echo "$storage_info" | awk '{print $5}')
+            local storage_avail=$(echo "$storage_info" | awk '{print $6}')
+            echo "  ${storage} (${storage_type}) - Available: ${storage_avail}"
+        done
+        echo ""
+        log_info "You can force using a storage with: --storage <name>"
+        exit 1
+    elif [[ ${#container_storage[@]} -eq 1 ]]; then
+        STORAGE="${container_storage[0]}"
+        log_success "Auto-selected container storage: ${STORAGE}"
+    else
+        log_error "Multiple active storage found that support containers. Please specify which one to use."
+        echo ""
+        log_info "Available container-compatible storage:"
+        for storage in "${container_storage[@]}"; do
+            local storage_info=$(pvesm status | grep "^${storage}")
+            local storage_type=$(echo "$storage_info" | awk '{print $2}')
             local storage_avail=$(echo "$storage_info" | awk '{print $6}')
             echo "  ${storage} (${storage_type}) - Available: ${storage_avail}"
         done
@@ -288,7 +498,62 @@ detect_storage() {
         log_info "  STORAGE=<name> $0 [other options]"
         log_info "  $0 --storage <name> [other options]"
         echo ""
-        log_info "Example: $0 --storage ${active_storage[0]}"
+        log_info "Example: $0 --storage ${container_storage[0]}"
+        exit 1
+    fi
+}
+
+# Detect template storage
+detect_template_storage() {
+    # Get list of active storage
+    local active_storage=($(pvesm status | grep "active" | awk '{print $1}'))
+
+    # Filter storage that supports templates
+    local template_storage=()
+    for storage in "${active_storage[@]}"; do
+        if check_storage_content_support "${storage}" "vztmpl"; then
+            template_storage+=("${storage}")
+        fi
+    done
+
+    if [[ ${#template_storage[@]} -eq 0 ]]; then
+        log_error "No active storage found that supports LXC templates"
+        log_info "Available active storage (may not support templates):"
+        for storage in "${active_storage[@]}"; do
+            local storage_info=$(pvesm status | grep "^${storage}")
+            local storage_type=$(echo "$storage_info" | awk '{print $2}')
+            local storage_avail=$(echo "$storage_info" | awk '{print $6}')
+            echo "  ${storage} (${storage_type}) - Available: ${storage_avail}"
+        done
+        echo ""
+        log_info "You can force using a storage with: --template-storage <name>"
+        exit 1
+    elif [[ ${#template_storage[@]} -eq 1 ]]; then
+        TEMPLATE_STORAGE="${template_storage[0]}"
+        log_success "Auto-selected template storage: ${TEMPLATE_STORAGE}"
+    else
+        # If container storage is set and supports templates, prefer it
+        if [[ -n "${STORAGE}" ]] && check_storage_content_support "${STORAGE}" "vztmpl"; then
+            TEMPLATE_STORAGE="${STORAGE}"
+            log_success "Using container storage for templates: ${TEMPLATE_STORAGE}"
+            return
+        fi
+
+        log_error "Multiple active storage found that support templates. Please specify which one to use."
+        echo ""
+        log_info "Available template-compatible storage:"
+        for storage in "${template_storage[@]}"; do
+            local storage_info=$(pvesm status | grep "^${storage}")
+            local storage_type=$(echo "$storage_info" | awk '{print $2}')
+            local storage_avail=$(echo "$storage_info" | awk '{print $6}')
+            echo "  ${storage} (${storage_type}) - Available: ${storage_avail}"
+        done
+        echo ""
+        log_info "Use one of these commands:"
+        log_info "  TEMPLATE_STORAGE=<name> $0 [other options]"
+        log_info "  $0 --template-storage <name> [other options]"
+        echo ""
+        log_info "Example: $0 --template-storage ${template_storage[0]}"
         exit 1
     fi
 }
@@ -339,16 +604,16 @@ check_container_exists() {
 
 # Download Fedora template if not available
 download_template() {
-    log_info "Checking for Fedora template '${TEMPLATE_NAME}' on storage '${STORAGE}'..."
+    log_info "Checking for Fedora template '${TEMPLATE_NAME}' on storage '${TEMPLATE_STORAGE}'..."
 
-    if ! pveam list "${STORAGE}" | grep -q "${TEMPLATE_NAME}"; then
-        log_info "Fedora template '${TEMPLATE_NAME}' not found on '${STORAGE}'..."
+    if ! pveam list "${TEMPLATE_STORAGE}" | grep -q "${TEMPLATE_NAME}"; then
+        log_info "Fedora template '${TEMPLATE_NAME}' not found on '${TEMPLATE_STORAGE}'..."
 
-        log_info "Downloading Fedora template '${TEMPLATE_NAME}' to '${STORAGE}'..."
-        pveam download "${STORAGE}" "${TEMPLATE_NAME}"
-        log_success "Template '${TEMPLATE_NAME}' downloaded successfully to '${STORAGE}'"
+        log_info "Downloading Fedora template '${TEMPLATE_NAME}' to '${TEMPLATE_STORAGE}'..."
+        pveam download "${TEMPLATE_STORAGE}" "${TEMPLATE_NAME}"
+        log_success "Template '${TEMPLATE_NAME}' downloaded successfully to '${TEMPLATE_STORAGE}'"
     else
-        log_success "Fedora template '${TEMPLATE_NAME}' already available on '${STORAGE}'"
+        log_success "Fedora template '${TEMPLATE_NAME}' already available on '${TEMPLATE_STORAGE}'"
     fi
 }
 
@@ -406,7 +671,7 @@ create_container() {
     fi
 
     # Create container with bridged networking
-    pct create "${CONTAINER_ID}" "${STORAGE}:vztmpl/${TEMPLATE_NAME}" \
+    pct create "${CONTAINER_ID}" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE_NAME}" \
         --hostname "${CONTAINER_NAME}" \
         --memory "${MEMORY}" \
         --cores "${CORES}" \
@@ -974,7 +1239,8 @@ main() {
     log_info "Starting setup with the following configuration:"
     log_info "Container ID: ${CONTAINER_ID}"
     log_info "Template: ${TEMPLATE_NAME}"
-    log_info "Storage: ${STORAGE}"
+    log_info "Container Storage: ${STORAGE}"
+    log_info "Template Storage: ${TEMPLATE_STORAGE}"
     log_info "Memory: ${MEMORY}MB"
     log_info "CPU Cores: ${CORES}"
     log_info "Root FS Size: ${ROOTFS_SIZE}GB"
@@ -1030,7 +1296,8 @@ show_usage() {
     echo ""
     echo "OPTIONS:"
     echo "  -c, --container-id ID    Container ID to use (default: auto-select next available)"
-    echo "  -s, --storage NAME       Storage to use (default: auto-detect if only one active)"
+    echo "  -s, --storage NAME       Container storage to use (default: auto-detect)"
+    echo "  -ts, --template-storage NAME  Template storage to use (default: auto-detect)"
     echo "  -m, --memory MB          Memory in MB (default: 2048)"
     echo "      --cpu, --cores NUM   CPU cores (default: 2)"
     echo "  -d, --disk GB            Root filesystem size in GB (default: 8)"
