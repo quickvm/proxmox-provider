@@ -141,6 +141,28 @@ parse_arguments() {
                 SKIP_API_USER=true
                 shift
                 ;;
+            --auto-update)
+                # Handle optional argument (true/false)
+                if [[ $# -gt 1 && -n "${2:-}" && "$2" != -* ]]; then
+                    case "$2" in
+                        true|True|TRUE|yes|Yes|YES|1)
+                            AUTO_UPDATE=true
+                            ;;
+                        false|False|FALSE|no|No|NO|0)
+                            AUTO_UPDATE=false
+                            ;;
+                        *)
+                            log_error "Invalid value for --auto-update: $2. Use 'true' or 'false'"
+                            exit 1
+                            ;;
+                    esac
+                    shift 2
+                else
+                    # No argument provided, default to true
+                    AUTO_UPDATE=true
+                    shift
+                fi
+                ;;
             -h|--help)
                 show_usage
                 exit 0
@@ -883,6 +905,35 @@ EOF"
     log_success "Quadlet service file created"
 }
 
+# Configure auto-update service
+configure_auto_update() {
+    if [[ "${AUTO_UPDATE}" == "true" ]]; then
+        log_info "Enabling Podman auto-update service..."
+
+        # Enable and start the podman auto-update timer
+        pct exec "${CONTAINER_ID}" -- systemctl enable podman-auto-update.timer
+        pct exec "${CONTAINER_ID}" -- systemctl start podman-auto-update.timer
+
+        log_success "Podman auto-update service enabled"
+        log_info "Container will check for updates daily and restart if newer images are available"
+    elif [[ "${AUTO_UPDATE}" == "false" ]]; then
+        log_info "Disabling Podman auto-update service..."
+
+        # Stop and disable the podman auto-update timer if it exists
+        if pct exec "${CONTAINER_ID}" -- systemctl is-enabled podman-auto-update.timer >/dev/null 2>&1; then
+            pct exec "${CONTAINER_ID}" -- systemctl stop podman-auto-update.timer 2>/dev/null || true
+            pct exec "${CONTAINER_ID}" -- systemctl disable podman-auto-update.timer 2>/dev/null || true
+            log_success "Podman auto-update service disabled"
+        else
+            log_info "Podman auto-update service was not enabled"
+        fi
+
+        log_info "Container will not automatically update"
+    else
+        log_info "Auto-update not specified - container will not automatically update"
+    fi
+}
+
 # Start the service
 start_service() {
     log_info "Starting the service..."
@@ -1254,6 +1305,7 @@ main() {
     log_info "Bridge: ${BRIDGE}"
     log_info "Host Port: ${HOST_PORT}"
     log_info "Image Tag: ${IMAGE_TAG}"
+    log_info "Auto Update: ${AUTO_UPDATE}"
     echo ""
 
     # Set up error handling
@@ -1281,6 +1333,7 @@ main() {
     configure_firewall
     update_environment_for_host_network
     create_quadlet_service
+    configure_auto_update
     start_service
     check_service_status
     show_completion_info
