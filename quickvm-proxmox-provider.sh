@@ -29,6 +29,10 @@ API_REALM="pve"
 ROLE_NAME="quickvm"
 GROUP_NAME="quickvm"
 
+# Cluster configuration
+CURRENT_NODE=""
+NODE_ID=""
+
 # Initialize variables with environment variable defaults
 MEMORY=${MEMORY:-2048}
 CORES=${CORES:-2}
@@ -193,6 +197,75 @@ check_proxmox() {
     if ! command -v pveum &> /dev/null; then
         error "Proxmox VE user management tool (pveum) not found. Are you on a Proxmox node?"
         exit 1
+    fi
+}
+
+# Detect cluster configuration and assign node-specific settings
+detect_cluster_config() {
+    log_info "Detecting cluster configuration..."
+
+    # Get current node name
+    CURRENT_NODE=$(hostname)
+    log_info "Current node: ${CURRENT_NODE}"
+
+    # Check if this is a cluster setup
+    local cluster_status=""
+    if command -v pvesh >/dev/null 2>&1; then
+        cluster_status=$(pvesh get /cluster/status --output-format json 2>/dev/null || echo "[]")
+    fi
+
+    # Parse cluster nodes and assign node ID
+    local nodes=()
+    if [[ "${cluster_status}" != "[]" ]] && command -v jq >/dev/null 2>&1; then
+        # Parse JSON to get node list
+        while IFS= read -r node; do
+            nodes+=("$node")
+        done < <(echo "${cluster_status}" | jq -r '.[] | select(.type == "node") | .name' 2>/dev/null | sort)
+    fi
+
+    # Fallback: try to detect nodes from /etc/pve/nodes if cluster detection fails
+    if [[ ${#nodes[@]} -eq 0 ]] && [[ -d "/etc/pve/nodes" ]]; then
+        while IFS= read -r node; do
+            nodes+=("$node")
+        done < <(ls /etc/pve/nodes/ 2>/dev/null | sort)
+    fi
+
+    # If still no nodes found, assume single node setup
+    if [[ ${#nodes[@]} -eq 0 ]]; then
+        nodes=("${CURRENT_NODE}")
+        log_info "Single node setup detected"
+    else
+        log_info "Cluster nodes detected: ${nodes[*]}"
+    fi
+
+    # Find current node's position in sorted list to determine node ID
+    NODE_ID=0
+    for i in "${!nodes[@]}"; do
+        if [[ "${nodes[$i]}" == "${CURRENT_NODE}" ]]; then
+            NODE_ID=$i
+            break
+        fi
+    done
+
+    log_success "Node configuration:"
+    log_success "  Node: ${CURRENT_NODE}"
+    log_success "  Node ID: ${NODE_ID}"
+    log_success "  Port: ${HOST_PORT} (same port on all nodes)"
+
+    # Show cluster info for reference
+    if [[ ${#nodes[@]} -gt 1 ]]; then
+        echo ""
+        log_info "Cluster setup detected - ${#nodes[@]} nodes:"
+        for i in "${!nodes[@]}"; do
+            if [[ "${nodes[$i]}" == "${CURRENT_NODE}" ]]; then
+                echo "  ${nodes[$i]} (this node) - port ${HOST_PORT}"
+            else
+                echo "  ${nodes[$i]} - port ${HOST_PORT}"
+            fi
+        done
+        echo ""
+        log_info "Run this script on each node to enable snippet writing on all nodes."
+        echo ""
     fi
 }
 
@@ -774,6 +847,201 @@ configure_firewall() {
     log_success "Firewall configured - port ${HOST_PORT} opened"
 }
 
+# Configure Proxmox node port access
+configure_node_access() {
+    log_info "Configuring Proxmox node access for port ${HOST_PORT}..."
+
+    # Get container IP address for reference
+    local container_ip=""
+    local max_attempts=10
+    local attempt=1
+
+    while [[ -z "${container_ip}" && $attempt -le $max_attempts ]]; do
+        container_ip=$(pct exec "${CONTAINER_ID}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+        if [[ -z "${container_ip}" ]]; then
+            log_info "Waiting for container IP... (attempt $attempt/$max_attempts)"
+            sleep 2
+            ((attempt++))
+        fi
+    done
+
+    if [[ -z "${container_ip}" ]]; then
+        log_warning "Could not determine container IP address - skipping node access configuration"
+        return 0
+    fi
+
+    log_info "Container IP: ${container_ip}"
+
+    # Create firewall directory if it doesn't exist
+    mkdir -p /etc/pve/firewall
+
+    # Create node-specific firewall rules to allow access to the port
+    local node_fw_file="/etc/pve/nodes/${CURRENT_NODE}/host.fw"
+
+    # Backup existing firewall file if it exists
+    if [[ -f "${node_fw_file}" ]]; then
+        cp "${node_fw_file}" "${node_fw_file}.backup.$(date +%Y%m%d_%H%M%S)"
+        log_info "Backed up existing node firewall configuration"
+    fi
+
+    log_info "Configuring node firewall to allow access to port ${HOST_PORT}"
+
+    # Check if our rule already exists
+    local rule_exists=false
+    if [[ -f "${node_fw_file}" ]] && grep -q "quickvm-provider-${HOST_PORT}" "${node_fw_file}"; then
+        rule_exists=true
+        log_info "Node access rule already exists, updating..."
+    fi
+
+    # Create or update the firewall configuration
+    if [[ "${rule_exists}" == "true" ]]; then
+        # Update existing rule by removing old one and adding new one
+        sed -i "/# quickvm-provider-${HOST_PORT}/,+1d" "${node_fw_file}"
+    fi
+
+    # Add the node access rule
+    {
+        if [[ ! -f "${node_fw_file}" ]] || ! grep -q "^\[OPTIONS\]" "${node_fw_file}"; then
+            echo "[OPTIONS]"
+            echo "enable: 1"
+            echo ""
+        fi
+
+        if ! grep -q "^\[RULES\]" "${node_fw_file}" 2>/dev/null; then
+            echo "[RULES]"
+        fi
+
+        echo "# quickvm-provider-${HOST_PORT}"
+        echo "IN ACCEPT -p tcp --dport ${HOST_PORT} -source +management"
+    } >> "${node_fw_file}"
+
+    # Setup port forwarding using iptables (persistent approach)
+    log_info "Setting up persistent port forwarding..."
+
+    # Create a helper script that reads config dynamically
+    cat > "/usr/local/bin/quickvm-port-forward.sh" << 'EOF'
+#!/bin/bash
+# QuickVM Port Forwarding Helper Script
+# Reads configuration from container environment and sets up iptables rules
+
+CONFIG_FILE="/etc/quickvm/quickvm-provider.env"
+CONTAINER_NAME="quickvm-provider"
+
+# Function to get container IP
+get_container_ip() {
+    local container_id=$(pct list | grep "${CONTAINER_NAME}" | awk '{print $1}' | head -n1)
+    if [[ -n "${container_id}" ]]; then
+        pct exec "${container_id}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1
+    fi
+}
+
+# Function to read port from config
+get_port() {
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        grep "^PORT=" "${CONFIG_FILE}" | cut -d'=' -f2 | tr -d ' '
+    else
+        echo "8071"  # Default fallback
+    fi
+}
+
+# Function to get cluster/management IP from Proxmox network config
+get_cluster_ip() {
+    # Get the IP from vmbr0 bridge (main cluster interface)
+    local cluster_ip=$(pvesh get /nodes/$(hostname)/network --output-format json 2>/dev/null | \
+        jq -r '.[] | select(.iface == "vmbr0" and .address != null) | .address' 2>/dev/null | head -n1)
+
+    # Fallback: get IP from hostname resolution
+    if [[ -z "${cluster_ip}" || "${cluster_ip}" == "null" ]]; then
+        cluster_ip=$(hostname -I | awk '{print $1}')
+    fi
+
+    echo "${cluster_ip}"
+}
+
+# Get current values
+CONTAINER_IP=$(get_container_ip)
+PORT=$(get_port)
+CLUSTER_IP=$(get_cluster_ip)
+
+if [[ -z "${CONTAINER_IP}" ]]; then
+    echo "Error: Could not determine container IP address"
+    exit 1
+fi
+
+if [[ -z "${PORT}" ]]; then
+    echo "Error: Could not determine port from configuration"
+    exit 1
+fi
+
+if [[ -z "${CLUSTER_IP}" ]]; then
+    echo "Error: Could not determine cluster IP address"
+    exit 1
+fi
+
+echo "Setting up port forwarding: ${CLUSTER_IP}:${PORT} -> ${CONTAINER_IP}:${PORT}"
+
+case "$1" in
+    start)
+        # Add DNAT rule scoped to cluster IP if it doesn't exist
+        iptables -t nat -C PREROUTING -d ${CLUSTER_IP} -p tcp --dport ${PORT} -j DNAT --to-destination ${CONTAINER_IP}:${PORT} 2>/dev/null || \
+        iptables -t nat -A PREROUTING -d ${CLUSTER_IP} -p tcp --dport ${PORT} -j DNAT --to-destination ${CONTAINER_IP}:${PORT}
+
+        # Add MASQUERADE rule if it doesn't exist
+        iptables -t nat -C POSTROUTING -p tcp -d ${CONTAINER_IP} --dport ${PORT} -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -p tcp -d ${CONTAINER_IP} --dport ${PORT} -j MASQUERADE
+        ;;
+    stop)
+        # Remove rules (ignore errors if rules don't exist)
+        iptables -t nat -D PREROUTING -d ${CLUSTER_IP} -p tcp --dport ${PORT} -j DNAT --to-destination ${CONTAINER_IP}:${PORT} 2>/dev/null || true
+        iptables -t nat -D POSTROUTING -p tcp -d ${CONTAINER_IP} --dport ${PORT} -j MASQUERADE 2>/dev/null || true
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
+EOF
+
+    # Make the script executable
+    chmod +x "/usr/local/bin/quickvm-port-forward.sh"
+
+    # Create a systemd service for port forwarding
+    cat > "/etc/systemd/system/quickvm-port-forward.service" << EOF
+[Unit]
+Description=QuickVM Port Forwarding
+After=network.target pve-firewall.service
+Requires=pve-firewall.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/quickvm-port-forward.sh start
+ExecStop=/usr/local/bin/quickvm-port-forward.sh stop
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Enable and start the port forwarding service
+    systemctl daemon-reload
+    systemctl enable "quickvm-port-forward.service"
+    systemctl start "quickvm-port-forward.service"
+
+    # Reload Proxmox firewall
+    if command -v pve-firewall >/dev/null; then
+        log_info "Reloading Proxmox firewall..."
+        if pve-firewall compile 2>/dev/null; then
+            systemctl reload pve-firewall
+            log_success "Node access configured for port ${HOST_PORT}"
+            log_success "Port forwarding active: ${CURRENT_NODE}:${HOST_PORT} -> ${container_ip}:${HOST_PORT}"
+        else
+            log_warning "Firewall compilation had warnings - but port forwarding should still work"
+        fi
+    else
+        log_warning "pve-firewall command not found - manual firewall reload may be required"
+    fi
+}
+
 # Update environment file for host networking
 update_environment_for_host_network() {
     log_info "Updating environment file for host networking..."
@@ -998,12 +1266,17 @@ show_completion_info() {
     echo "Container ID: ${CONTAINER_ID}"
     echo "Container Name: ${CONTAINER_NAME}"
     echo "Container IP: ${container_ip}"
-    echo "Service URL: https://${container_ip}:${HOST_PORT}"
+    echo "Node: ${CURRENT_NODE}"
+    echo "Node ID: ${NODE_ID}"
+    echo "Service URL (via container): https://${container_ip}:${HOST_PORT}"
+    echo "Service URL (via Proxmox node): https://$(hostname -I | awk '{print $1}'):${HOST_PORT}"
     echo ""
-    echo "Using bridged networking - service accessible directly via container IP"
+    echo "Port forwarding configured: ${CURRENT_NODE}:${HOST_PORT} -> container:${HOST_PORT}"
+    echo "Service is accessible both directly via container IP and through the Proxmox node"
     echo ""
     echo "Test the service health endpoint:"
     echo "  curl -s https://${container_ip}:${HOST_PORT}/health --insecure"
+    echo "  curl -s https://$(hostname -I | awk '{print $1}'):${HOST_PORT}/health --insecure"
     echo ""
     echo "To check service status:"
     echo "  pct exec ${CONTAINER_ID} -- systemctl status quickvm-provider.service"
@@ -1221,6 +1494,24 @@ uninstall_service() {
             rm -f "$firewall_file"
         fi
 
+        # Remove node firewall rule
+        local node_fw="/etc/pve/nodes/$(hostname)/host.fw"
+        if [[ -f "$node_fw" ]] && grep -q "quickvm-provider-${HOST_PORT}" "$node_fw"; then
+            log_info "Removing node firewall rule..."
+            sed -i "/# quickvm-provider-${HOST_PORT}/,+1d" "$node_fw"
+        fi
+
+        # Remove port forwarding service and helper script
+        local port_service="quickvm-port-forward.service"
+        if systemctl is-enabled "$port_service" >/dev/null 2>&1; then
+            log_info "Removing port forwarding service..."
+            systemctl stop "$port_service" 2>/dev/null || true
+            systemctl disable "$port_service" 2>/dev/null || true
+            rm -f "/etc/systemd/system/$port_service"
+            rm -f "/usr/local/bin/quickvm-port-forward.sh"
+            systemctl daemon-reload
+        fi
+
         log_success "Container $container_id removed successfully"
     done
 
@@ -1313,6 +1604,8 @@ main() {
 
     # Execute setup steps
     check_root
+    check_proxmox
+    detect_cluster_config
     get_latest_fedora_template
     check_existing_containers
     check_container_exists
@@ -1331,6 +1624,7 @@ main() {
     start_container
     setup_container_packages
     configure_firewall
+    configure_node_access
     update_environment_for_host_network
     create_quadlet_service
     configure_auto_update
@@ -1497,6 +1791,7 @@ create_vm_role() {
         "Datastore.Audit"    # View datastore usage
         "Datastore.AllocateTemplate" # Allocate templates
         "Sys.Modify"      # Modify system settings and use download-url
+        "sys.Audit"        # View system settings
 
         # Pool management (if using resource pools)
         "Pool.Allocate"     # Use resource pools
