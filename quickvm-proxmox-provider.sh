@@ -1495,6 +1495,8 @@ create_vm_role() {
         "Datastore.Allocate" # Use datastores
         "Datastore.AllocateSpace" # Allocate space on datastores
         "Datastore.Audit"    # View datastore usage
+        "Datastore.AllocateTemplate" # Allocate templates
+        "Sys.Modify"      # Modify system settings and use download-url
 
         # Pool management (if using resource pools)
         "Pool.Allocate"     # Use resource pools
