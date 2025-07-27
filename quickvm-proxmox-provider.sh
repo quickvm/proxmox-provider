@@ -875,7 +875,7 @@ create_container() {
         --unprivileged 1 \
         --features nesting=1
 
-    log_success "Container created successfully with bridged networking and MAC address ${mac_address}"
+    log_success "Container created successfully with bridged networking and MAC address ${MAC_ADDRESS}"
 }
 
 # Configure container bind mounts
@@ -1615,7 +1615,7 @@ uninstall_service() {
         exit 1
     fi
 
-    log_info "Found ${CONTAINER_NAME} container(s): $containers"
+    log_info "Found ${CONTAINER_NAME} container(s): $CONTAINERS"
     echo ""
 
     # Confirmation prompt
@@ -1697,7 +1697,7 @@ uninstall_service() {
             systemctl daemon-reload
         fi
 
-        log_success "Container $container_id removed successfully"
+        log_success "Container $CONTAINER_ID_ITEM removed successfully"
     done
 
     # Reload firewall if pve-firewall is available
@@ -1716,12 +1716,12 @@ uninstall_service() {
     echo "     rm -rf /etc/quickvm"
     echo ""
     echo "  2. Remove Fedora template if no longer needed:"
-    if [[ -n "$container_storage" ]]; then
-        if [[ -n "$container_template" ]]; then
-            echo "     pveam remove $container_storage:$container_template"
+    if [[ -n "$CONTAINER_STORAGE_INFO" ]]; then
+        if [[ -n "$CONTAINER_TEMPLATE_INFO" ]]; then
+            echo "     pveam remove $CONTAINER_STORAGE_INFO:$CONTAINER_TEMPLATE_INFO"
         else
-            echo "     # Check downloaded templates with: pveam list $container_storage"
-            echo "     # Remove with: pveam remove $container_storage:vztmpl/<template-name>"
+            echo "     # Check downloaded templates with: pveam list $CONTAINER_STORAGE_INFO"
+            echo "     # Remove with: pveam remove $CONTAINER_STORAGE_INFO:vztmpl/<template-name>"
         fi
     else
         echo "     # Check downloaded templates with: pveam list <storage>"
