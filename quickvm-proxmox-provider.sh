@@ -123,9 +123,9 @@ validate_interfaces() {
         ip addr show | grep -E '^[0-9]+:' | while read LINE; do
             IFACE=$(echo "${LINE}" | awk -F': ' '{print $2}' | cut -d'@' -f1)
             if [[ "${IFACE}" != "lo" ]]; then
-                    IP=$(ip addr show "${IFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
-                    if [[ -n "${IP}" ]]; then
-                        echo "    ${IFACE}: ${IP}"
+                    IP_LOCAL=$(ip addr show "${IFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+                    if [[ -n "${IP_LOCAL}" ]]; then
+                        echo "    ${IFACE}: ${IP_LOCAL}"
                     fi
                 fi
         done
@@ -239,7 +239,7 @@ parse_arguments() {
                 for LINE in "${INTERFACE_ARRAY[@]}"; do
                     IFACE=$(echo "${LINE}" | awk -F': ' '{print $2}' | cut -d'@' -f1)
                     if [[ "${IFACE}" != "lo" ]]; then
-                        IP=$(ip addr show "${IFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+                        IP_LOCAL=$(ip addr show "${IFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
                         STATE=$(echo "${LINE}" | grep -o 'state [A-Z]*' | awk '{print $2}' || echo "UNKNOWN")
 
                         # Check interface flags to provide more intuitive status
@@ -250,8 +250,8 @@ parse_arguments() {
                             fi
                         fi
 
-                        if [[ -n "${IP}" ]]; then
-                            printf "  %-15s %s (%s)\n" "${IFACE}" "${IP}" "${STATE}"
+                        if [[ -n "${IP_LOCAL}" ]]; then
+                            printf "  %-15s %s (%s)\n" "${IFACE}" "${IP_LOCAL}" "${STATE}"
                         else
                             printf "  %-15s %s (%s)\n" "${IFACE}" "no IP" "${STATE}"
                         fi
@@ -328,11 +328,11 @@ detect_cluster_config() {
     fi
 
     # If still no nodes found, assume single node setup
-    if [[ ${#nodes[@]} -eq 0 ]]; then
-        nodes=("${CURRENT_NODE}")
+    if [[ ${#NODES[@]} -eq 0 ]]; then
+        NODES=("${CURRENT_NODE}")
         log_info "Single node setup detected"
     else
-        log_info "Cluster nodes detected: ${nodes[*]}"
+        log_info "Cluster nodes detected: ${NODES[*]}"
     fi
 
     # Find current node's position in sorted list to determine node ID
@@ -451,13 +451,13 @@ check_storage_content_support() {
     local REQUIRED_CONTENT="$2"
 
     # First check if storage is active using pvesm status
-    local storage_info=$(pvesm status | grep "^${storage_name}")
-    if [[ -z "${storage_info}" ]]; then
+    local STORAGE_INFO=$(pvesm status | grep "^${STORAGE_NAME}")
+    if [[ -z "${STORAGE_INFO}" ]]; then
         return 1  # Storage not found
     fi
 
     # Check if storage is active
-    if ! echo "${storage_info}" | grep -q "active"; then
+    if ! echo "${STORAGE_INFO}" | grep -q "active"; then
         return 1  # Storage not active
     fi
 
@@ -468,7 +468,7 @@ check_storage_content_support() {
     fi
 
             # Check if storage is disabled in config and get content types
-    local storage_block=$(awk -v storage="${storage_name}" '
+    local STORAGE_BLOCK=$(awk -v storage="${STORAGE_NAME}" '
         /^[a-zA-Z]+: / {
             # If we were processing a previous storage, output its result
             if (current_storage && current_storage == storage) {
@@ -499,7 +499,7 @@ check_storage_content_support() {
         }
     ' /etc/pve/storage.cfg)
 
-        if [[ "${storage_block}" == "DISABLED" ]]; then
+        if [[ "${STORAGE_BLOCK}" == "DISABLED" ]]; then
         return 1  # Storage is disabled
     fi
 
@@ -644,9 +644,9 @@ detect_storage() {
 # Detect container storage
 detect_container_storage() {
     # Get list of active storage
-    local active_storage=($(pvesm status | grep "active" | awk '{print $1}'))
+    local ACTIVE_STORAGE=($(pvesm status | grep "active" | awk '{print $1}'))
 
-    if [[ ${#active_storage[@]} -eq 0 ]]; then
+    if [[ ${#ACTIVE_STORAGE[@]} -eq 0 ]]; then
         log_error "No active storage found"
         log_info "Available storage:"
         pvesm status | awk 'NR>1 {print "  " $1 " (" $2 ", " $3 ")"}'
@@ -654,44 +654,45 @@ detect_container_storage() {
     fi
 
     # Filter storage that supports containers
-    local container_storage=()
-    for storage in "${active_storage[@]}"; do
-        if check_storage_content_support "${storage}" "rootdir"; then
-            container_storage+=("${storage}")
+    local CONTAINER_STORAGE=()
+    for STORAGE in "${ACTIVE_STORAGE[@]}"; do
+        if check_storage_content_support "${STORAGE}" "rootdir"; then
+            CONTAINER_STORAGE+=("${STORAGE}")
         fi
     done
 
-    if [[ ${#container_storage[@]} -eq 0 ]]; then
+    if [[ ${#CONTAINER_STORAGE[@]} -eq 0 ]]; then
         log_error "No active storage found that supports LXC containers"
         log_info "Available active storage (may not support containers):"
-        for storage in "${active_storage[@]}"; do
-            local storage_info=$(pvesm status | grep "^${storage}")
-            local storage_type=$(echo "$storage_info" | awk '{print $2}')
-            local storage_avail=$(echo "$storage_info" | awk '{print $6}')
-            echo "  ${storage} (${storage_type}) - Available: ${storage_avail}"
+        for STORAGE in "${ACTIVE_STORAGE[@]}"; do
+            local STORAGE_INFO=$(pvesm status | grep "^${STORAGE}")
+            local STORAGE_TYPE=$(echo "$STORAGE_INFO" | awk '{print $2}')
+            local STORAGE_AVAIL=$(echo "$STORAGE_INFO" | awk '{print $6}')
+            echo "  ${STORAGE} (${STORAGE_TYPE}) - Available: ${STORAGE_AVAIL}"
         done
         echo ""
         log_info "You can force using a storage with: --storage <name>"
         exit 1
-    elif [[ ${#container_storage[@]} -eq 1 ]]; then
-        STORAGE="${container_storage[0]}"
+    elif [[ ${#CONTAINER_STORAGE[@]} -eq 1 ]]; then
+        STORAGE="${CONTAINER_STORAGE[0]}"
         log_success "Auto-selected container storage: ${STORAGE}"
     else
         log_error "Multiple active storage found that support containers. Please specify which one to use."
         echo ""
         log_info "Available container-compatible storage:"
-        for storage in "${container_storage[@]}"; do
-            local storage_info=$(pvesm status | grep "^${storage}")
-            local storage_type=$(echo "$storage_info" | awk '{print $2}')
-            local storage_avail=$(echo "$storage_info" | awk '{print $6}')
-            echo "  ${storage} (${storage_type}) - Available: ${storage_avail}"
+        log_info "Available container-compatible storage:"
+        for STORAGE in "${CONTAINER_STORAGE[@]}"; do
+            local STORAGE_INFO=$(pvesm status | grep "^${STORAGE}")
+            local STORAGE_TYPE=$(echo "$STORAGE_INFO" | awk '{print $2}')
+            local STORAGE_AVAIL=$(echo "$STORAGE_INFO" | awk '{print $6}')
+            echo "  ${STORAGE} (${STORAGE_TYPE}) - Available: ${STORAGE_AVAIL}"
         done
         echo ""
         log_info "Use one of these commands:"
         log_info "  STORAGE=<name> $0 [other options]"
         log_info "  $0 --storage <name> [other options]"
         echo ""
-        log_info "Example: $0 --storage ${container_storage[0]}"
+        log_info "Example: $0 --storage ${CONTAINER_STORAGE[0]}"
         exit 1
     fi
 }
@@ -699,30 +700,30 @@ detect_container_storage() {
 # Detect template storage
 detect_template_storage() {
     # Get list of active storage
-    local active_storage=($(pvesm status | grep "active" | awk '{print $1}'))
+    local ACTIVE_STORAGE=($(pvesm status | grep "active" | awk '{print $1}'))
 
     # Filter storage that supports templates
-    local template_storage=()
-    for storage in "${active_storage[@]}"; do
-        if check_storage_content_support "${storage}" "vztmpl"; then
-            template_storage+=("${storage}")
+    local TEMPLATE_STORAGE_LIST=()
+    for STORAGE in "${ACTIVE_STORAGE[@]}"; do
+        if check_storage_content_support "${STORAGE}" "vztmpl"; then
+            TEMPLATE_STORAGE_LIST+=("${STORAGE}")
         fi
     done
 
-    if [[ ${#template_storage[@]} -eq 0 ]]; then
+    if [[ ${#TEMPLATE_STORAGE_LIST[@]} -eq 0 ]]; then
         log_error "No active storage found that supports LXC templates"
         log_info "Available active storage (may not support templates):"
-        for storage in "${active_storage[@]}"; do
-            local storage_info=$(pvesm status | grep "^${storage}")
-            local storage_type=$(echo "$storage_info" | awk '{print $2}')
-            local storage_avail=$(echo "$storage_info" | awk '{print $6}')
-            echo "  ${storage} (${storage_type}) - Available: ${storage_avail}"
+        for STORAGE in "${ACTIVE_STORAGE[@]}"; do
+            local STORAGE_INFO=$(pvesm status | grep "^${STORAGE}")
+            local STORAGE_TYPE=$(echo "$STORAGE_INFO" | awk '{print $2}')
+            local STORAGE_AVAIL=$(echo "$STORAGE_INFO" | awk '{print $6}')
+            echo "  ${STORAGE} (${STORAGE_TYPE}) - Available: ${STORAGE_AVAIL}"
         done
         echo ""
         log_info "You can force using a storage with: --template-storage <name>"
         exit 1
-    elif [[ ${#template_storage[@]} -eq 1 ]]; then
-        TEMPLATE_STORAGE="${template_storage[0]}"
+    elif [[ ${#TEMPLATE_STORAGE_LIST[@]} -eq 1 ]]; then
+        TEMPLATE_STORAGE="${TEMPLATE_STORAGE_LIST[0]}"
         log_success "Auto-selected template storage: ${TEMPLATE_STORAGE}"
     else
         # If container storage is set and supports templates, prefer it
@@ -735,18 +736,19 @@ detect_template_storage() {
         log_error "Multiple active storage found that support templates. Please specify which one to use."
         echo ""
         log_info "Available template-compatible storage:"
-        for storage in "${template_storage[@]}"; do
-            local storage_info=$(pvesm status | grep "^${storage}")
-            local storage_type=$(echo "$storage_info" | awk '{print $2}')
-            local storage_avail=$(echo "$storage_info" | awk '{print $6}')
-            echo "  ${storage} (${storage_type}) - Available: ${storage_avail}"
+        log_info "Available template-compatible storage:"
+        for STORAGE in "${TEMPLATE_STORAGE_LIST[@]}"; do
+            local STORAGE_INFO=$(pvesm status | grep "^${STORAGE}")
+            local STORAGE_TYPE=$(echo "$STORAGE_INFO" | awk '{print $2}')
+            local STORAGE_AVAIL=$(echo "$STORAGE_INFO" | awk '{print $6}')
+            echo "  ${STORAGE} (${STORAGE_TYPE}) - Available: ${STORAGE_AVAIL}"
         done
         echo ""
         log_info "Use one of these commands:"
         log_info "  TEMPLATE_STORAGE=<name> $0 [other options]"
         log_info "  $0 --template-storage <name> [other options]"
         echo ""
-        log_info "Example: $0 --template-storage ${template_storage[0]}"
+        log_info "Example: $0 --template-storage ${TEMPLATE_STORAGE_LIST[0]}"
         exit 1
     fi
 }
@@ -756,34 +758,32 @@ find_next_container_id() {
     log_info "Finding next available container ID..."
 
     # Get list of existing container and VM IDs
-    local used_ids=($(pvesh get /cluster/resources --type vm --output-format json | jq -r '.[].vmid' 2>/dev/null))
+    local USED_IDS=($(pvesh get /cluster/resources --type vm --output-format json | jq -r '.[].vmid' 2>/dev/null))
 
     # If jq is not available, use alternative method
-    if [[ ${#used_ids[@]} -eq 0 ]]; then
+    if [[ ${#USED_IDS[@]} -eq 0 ]]; then
         # Try using pct list and qm list
-        used_ids+=($(pct list | awk 'NR>1 {print $1}' 2>/dev/null))
-        used_ids+=($(qm list | awk 'NR>1 {print $1}' 2>/dev/null))
+        USED_IDS+=($(pct list | awk 'NR>1 {print $1}' 2>/dev/null))
+        USED_IDS+=($(qm list | awk 'NR>1 {print $1}' 2>/dev/null))
     fi
 
     # Sort the IDs
-    if [[ ${#used_ids[@]} -gt 0 ]]; then
-        IFS=$'\n' used_ids=($(sort -n <<<"${used_ids[*]}"))
+    if [[ ${#USED_IDS[@]} -gt 0 ]]; then
+        IFS=$'\n' USED_IDS=($(sort -n <<<"${USED_IDS[*]}"))
     fi
 
-    log_info "Currently used IDs: ${used_ids[*]:-none}"
+    log_info "Currently used IDs: ${USED_IDS[*]:-none}"
 
     # Find the first available ID starting from 100
-    local next_id=100
-    for used_id in "${used_ids[@]}"; do
-        if [[ $next_id -eq $used_id ]]; then
-            ((next_id++))
-        elif [[ $next_id -lt $used_id ]]; then
-            break
+    local NEXT_ID=100
+    for USED_ID in "${USED_IDS[@]}"; do
+        if [[ $NEXT_ID -eq $USED_ID ]]; then
+            ((NEXT_ID++))
         fi
     done
 
-    CONTAINER_ID=$next_id
-    log_success "Selected container ID: ${CONTAINER_ID}"
+    CONTAINER_ID=$NEXT_ID
+    log_success "Using container ID: ${CONTAINER_ID}"
 }
 
 # Check if container ID is already in use (now only used for manual override)
@@ -854,14 +854,12 @@ create_container() {
     store_mac_address "${MAC_ADDRESS}"
 
     # Determine network configuration
-    local net_config=""
+    local NET_CONFIG=""
     # Create container with dynamic network configuration
     if [[ -n "${IP_ADDRESS}" && -n "${GATEWAY}" ]]; then
-        net_config="name=eth0,bridge=${BRIDGE},gw=${GATEWAY},ip=${IP_ADDRESS},firewall=1,hwaddr=${MAC_ADDRESS}"
-        log_info "Creating LXC container with ID ${CONTAINER_ID} using static IP ${IP_ADDRESS}..."
+        NET_CONFIG="name=eth0,bridge=${BRIDGE},gw=${GATEWAY},ip=${IP_ADDRESS},firewall=1,hwaddr=${MAC_ADDRESS}"
     else
-        net_config="name=eth0,bridge=${BRIDGE},ip=dhcp,firewall=1,hwaddr=${MAC_ADDRESS}"
-        log_info "Creating LXC container with ID ${CONTAINER_ID} using DHCP with MAC ${MAC_ADDRESS}..."
+        NET_CONFIG="name=eth0,bridge=${BRIDGE},firewall=1,hwaddr=${MAC_ADDRESS}"
     fi
 
     # Create container with bridged networking
@@ -870,7 +868,7 @@ create_container() {
         --memory "${MEMORY}" \
         --cores "${CORES}" \
         --rootfs "${STORAGE}:${ROOTFS_SIZE}" \
-        --net0 "${net_config}" \
+        --net0 "${NET_CONFIG}" \
         --nameserver 1.1.1.1 \
         --nameserver 8.8.8.8 \
         --onboot 1 \
@@ -901,17 +899,17 @@ start_container() {
     sleep 10
 
     # Wait for network to be available
-    local max_attempts=30
-    local attempt=1
+    local MAX_ATTEMPTS=30
+    local ATTEMPT=1
 
     while ! pct exec "${CONTAINER_ID}" -- ping -c 1 8.8.8.8 &>/dev/null; do
-        if [[ $attempt -ge $max_attempts ]]; then
-            log_error "Container network not ready after ${max_attempts} attempts"
+        if [[ $ATTEMPT -ge $MAX_ATTEMPTS ]]; then
+            log_error "Container network not ready after ${MAX_ATTEMPTS} attempts"
             exit 1
         fi
-        log_info "Waiting for network... (attempt $attempt/$max_attempts)"
+        log_info "Waiting for network... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
         sleep 2
-        ((attempt++))
+        ((ATTEMPT++))
     done
 
     log_success "Container started and network is ready"
@@ -950,16 +948,16 @@ configure_node_access() {
     log_info "Configuring Proxmox node access for port ${HOST_PORT}..."
 
     # Get container IP address for reference
-    local CONTAINER_IP=""
-    local MAX_ATTEMPTS=10
-    local ATTEMPT=1
+    local CONTAINER_IP_LOCAL=""
+    local MAX_ATTEMPTS_LOCAL=10
+    local ATTEMPT_LOCAL=1
 
-    while [[ -z "${CONTAINER_IP}" && $ATTEMPT -le $MAX_ATTEMPTS ]]; do
-        CONTAINER_IP=$(pct exec "${CONTAINER_ID}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true)
-        if [[ -z "${CONTAINER_IP}" ]]; then
-            log_info "Waiting for container IP... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
-            sleep 2
-            ((ATTEMPT++))
+    while [[ -z "${CONTAINER_IP_LOCAL}" && $ATTEMPT_LOCAL -le $MAX_ATTEMPTS_LOCAL ]]; do
+        CONTAINER_IP_LOCAL=$(pct exec "${CONTAINER_ID}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true)
+        if [[ -z "${CONTAINER_IP_LOCAL}" ]]; then
+            log_info "Waiting for container network... (attempt $ATTEMPT_LOCAL/$MAX_ATTEMPTS_LOCAL)"
+            sleep 5
+            ((ATTEMPT_LOCAL++))
         fi
     done
 
@@ -974,27 +972,29 @@ configure_node_access() {
     mkdir -p /etc/pve/firewall
 
     # Create node-specific firewall rules to allow access to the port
-    local NODE_FW_FILE="/etc/pve/nodes/${CURRENT_NODE}/host.fw"
+    local NODE_FW_FILE_LOCAL="/etc/pve/nodes/${CURRENT_NODE}/host.fw"
 
     # Backup existing firewall file if it exists
-    if [[ -f "${NODE_FW_FILE}" ]]; then
-        cp "${NODE_FW_FILE}" "${NODE_FW_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+    if [[ -f "${NODE_FW_FILE_LOCAL}" ]]; then
+        cp "${NODE_FW_FILE_LOCAL}" "${NODE_FW_FILE_LOCAL}.backup.$(date +%Y%m%d%H%M%S)"
         log_info "Backed up existing node firewall configuration"
+    fi
+
+    # Create nodes directory if it doesn't exist
+    mkdir -p "/etc/pve/nodes/${CURRENT_NODE}"
+
+    # Check if our rule already exists
+    local RULE_EXISTS_LOCAL=false
+    if [[ -f "${NODE_FW_FILE_LOCAL}" ]] && grep -q "quickvm-provider-${HOST_PORT}" "${NODE_FW_FILE_LOCAL}"; then
+        RULE_EXISTS_LOCAL=true
     fi
 
     log_info "Configuring node firewall to allow access to port ${HOST_PORT}"
 
-    # Check if our rule already exists
-    local RULE_EXISTS=false
-    if [[ -f "${NODE_FW_FILE}" ]] && grep -q "quickvm-provider-${HOST_PORT}" "${NODE_FW_FILE}"; then
-        RULE_EXISTS=true
-        log_info "Node access rule already exists, updating..."
-    fi
-
     # Create or update the firewall configuration
-    if [[ "${RULE_EXISTS}" == "true" ]]; then
+    if [[ "${RULE_EXISTS_LOCAL}" == "true" ]]; then
         # Update existing rule by removing old one and adding new one
-        sed -i "/# quickvm-provider-${HOST_PORT}/,+1d" "${NODE_FW_FILE}"
+        sed -i "/# quickvm-provider-${HOST_PORT}/,+1d" "${NODE_FW_FILE_LOCAL}"
     fi
 
     # Add the node access rule
@@ -1027,9 +1027,9 @@ CONTAINER_NAME="quickvm-provider"
 
 # Function to get container IP
 get_container_ip() {
-    local container_id=$(pct list | grep "${CONTAINER_NAME}" | awk '{print $1}' | head -n1)
-    if [[ -n "${container_id}" ]]; then
-        pct exec "${container_id}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true
+    local CONTAINER_ID_LOCAL=$(pct list | grep "${CONTAINER_NAME}" | awk '{print $1}' | head -n1)
+    if [[ -n "${CONTAINER_ID_LOCAL}" ]]; then
+        pct exec "${CONTAINER_ID_LOCAL}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true
     fi
 }
 
@@ -1048,7 +1048,7 @@ get_forwarding_ips() {
 
     # Read interfaces from config file
     if [[ -f "${CONFIG_FILE}" ]]; then
-        INTERFACES=$(grep "^INTERFACES=" "${CONFIG_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
+        INTERFACES=$(grep "^INTERFACES=" "${CONFIG_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d ' ' || true)
     fi
 
     # If no interfaces specified, use legacy behavior (vmbr0 or hostname -I)
@@ -1065,21 +1065,20 @@ get_forwarding_ips() {
     fi
 
     # Get IPs from specified interfaces
-    local IP_LIST=""
+    local IP_LIST_LOCAL=""
     IFS=',' read -ra INTERFACE_ARRAY <<< "${INTERFACES}"
     for INTERFACE in "${INTERFACE_ARRAY[@]}"; do
         INTERFACE=$(echo "${INTERFACE}" | xargs)  # trim whitespace
-        local IP=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
-        if [[ -n "${IP}" ]]; then
-            if [[ -n "${IP_LIST}" ]]; then
-                IP_LIST="${IP_LIST},${IP}"
+        local IP_LOCAL=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+        if [[ -n "${IP_LOCAL}" ]]; then
+            if [[ -n "${IP_LIST_LOCAL}" ]]; then
+                IP_LIST_LOCAL="${IP_LIST_LOCAL} ${IP_LOCAL}"
             else
-                IP_LIST="${IP}"
+                IP_LIST_LOCAL="${IP_LOCAL}"
             fi
         fi
     done
-
-    echo "${IP_LIST}"
+    echo "${IP_LIST_LOCAL}"
 }
 
 # Get current values
@@ -1177,16 +1176,16 @@ EOF
             # Show which interfaces are being used for port forwarding
             if [[ -n "${INTERFACES}" ]]; then
                 # Get the actual IPs for the specified interfaces
-                local FORWARDING_DETAILS=""
+                local FORWARDING_DETAILS_LOCAL=""
                 IFS=',' read -ra INTERFACE_ARRAY <<< "${INTERFACES}"
                 for INTERFACE in "${INTERFACE_ARRAY[@]}"; do
                     INTERFACE=$(echo "${INTERFACE}" | xargs)  # trim whitespace
-                    local IP=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
-                    if [[ -n "${IP}" ]]; then
-                        if [[ -n "${FORWARDING_DETAILS}" ]]; then
-                            FORWARDING_DETAILS="${FORWARDING_DETAILS}, ${INTERFACE}:${IP}"
+                    local IP_LOCAL=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+                    if [[ -n "${IP_LOCAL}" ]]; then
+                        if [[ -n "${FORWARDING_DETAILS_LOCAL}" ]]; then
+                            FORWARDING_DETAILS_LOCAL="${FORWARDING_DETAILS_LOCAL}, ${INTERFACE}:${IP_LOCAL}"
                         else
-                            FORWARDING_DETAILS="${INTERFACE}:${IP}"
+                            FORWARDING_DETAILS_LOCAL="${INTERFACE}:${IP_LOCAL}"
                         fi
                     fi
                 done
@@ -1210,15 +1209,15 @@ update_environment_for_host_network() {
     pct exec "${CONTAINER_ID}" -- mkdir -p /etc/quickvm
 
     # Check if config file already exists in container and has meaningful content
-    local has_full_config=false
+    local HAS_FULL_CONFIG=false
     if pct exec "${CONTAINER_ID}" -- test -f /etc/quickvm/quickvm-provider.env; then
         # Check if the file has more than just MAC/API_KEY/PORT (i.e., has ENABLE_TLS or ENVIRONMENT)
         if pct exec "${CONTAINER_ID}" -- grep -q "ENABLE_TLS\|ENVIRONMENT" /etc/quickvm/quickvm-provider.env; then
-            has_full_config=true
+            HAS_FULL_CONFIG=true
         fi
     fi
 
-    if [[ "${has_full_config}" == "true" ]]; then
+    if [[ "${HAS_FULL_CONFIG}" == "true" ]]; then
         log_info "Existing environment file with full configuration found, preserving user configuration..."
 
         # Get current MAC address from host config
@@ -1253,9 +1252,9 @@ update_environment_for_host_network() {
         fi
 
         # Read back the API key that's actually in the file to update our global variable
-        local EXISTING_API_KEY=$(grep "^API_KEY=" /etc/quickvm/quickvm-provider.env | cut -d'=' -f2 | tr -d ' ')
-        if [[ -n "${EXISTING_API_KEY}" ]]; then
-            API_KEY="${EXISTING_API_KEY}"
+        local EXISTING_API_KEY_LOCAL=$(grep "^API_KEY=" /etc/quickvm/quickvm-provider.env | cut -d'=' -f2 | tr -d ' ')
+        if [[ -n "${EXISTING_API_KEY_LOCAL}" ]]; then
+            API_KEY="${EXISTING_API_KEY_LOCAL}"
             API_KEY_WAS_GENERATED=false
             log_info "Using existing API key from configuration file"
         fi
@@ -1264,15 +1263,15 @@ update_environment_for_host_network() {
     else
         # Create new environment file with all default values (or replace minimal config)
         local CURRENT_MAC=$(read_existing_mac)
-        local EXISTING_API_KEY=""
+        local EXISTING_API_KEY_LOCAL=""
 
         # Check if there's an existing API key in a minimal config file before replacing it
         if pct exec "${CONTAINER_ID}" -- test -f /etc/quickvm/quickvm-provider.env; then
             log_info "Found minimal configuration file, checking for existing API key..."
-            EXISTING_API_KEY=$(grep "^API_KEY=" /etc/quickvm/quickvm-provider.env 2>/dev/null | cut -d'=' -f2 | tr -d ' ' || true)
-            if [[ -n "${EXISTING_API_KEY}" ]]; then
+            EXISTING_API_KEY_LOCAL=$(grep "^API_KEY=" /etc/quickvm/quickvm-provider.env 2>/dev/null | cut -d'=' -f2 | tr -d ' ' || true)
+            if [[ -n "${EXISTING_API_KEY_LOCAL}" ]]; then
                 log_info "Found existing API key in minimal config, preserving it..."
-                API_KEY="${EXISTING_API_KEY}"
+                API_KEY="${EXISTING_API_KEY_LOCAL}"
                 API_KEY_WAS_GENERATED=false
             fi
             log_info "Replacing minimal configuration with full default configuration..."
@@ -1421,14 +1420,14 @@ check_service_status() {
 # Show completion information
 show_completion_info() {
     # Get container IP address
-    local CONTAINER_IP=""
+    local CONTAINER_IP_INFO=""
 
     # Try to get container IP from pct exec
-    if CONTAINER_IP=$(pct exec "${CONTAINER_ID}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true) && [[ -n "${CONTAINER_IP}" ]]; then
-        log_info "Container has IP address: ${CONTAINER_IP}"
+    if CONTAINER_IP_INFO=$(pct exec "${CONTAINER_ID}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true) && [[ -n "${CONTAINER_IP_INFO}" ]]; then
+        log_info "Container has IP address: ${CONTAINER_IP_INFO}"
     else
         log_warning "Could not determine container IP address"
-        CONTAINER_IP="<container-ip>"
+        CONTAINER_IP_INFO="<container-ip>"
     fi
 
     echo ""
@@ -1449,9 +1448,9 @@ show_completion_info() {
         IFS=',' read -ra INTERFACE_ARRAY <<< "${INTERFACES}"
         for INTERFACE in "${INTERFACE_ARRAY[@]}"; do
             INTERFACE=$(echo "${INTERFACE}" | xargs)  # trim whitespace
-            local IP=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
-            if [[ -n "${IP}" ]]; then
-                echo "  ${INTERFACE}: https://${IP}:${HOST_PORT}"
+            local IP_LOCAL=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+            if [[ -n "${IP_LOCAL}" ]]; then
+                echo "  ${INTERFACE}: https://${IP_LOCAL}:${HOST_PORT}"
             fi
         done
         echo ""
@@ -1536,8 +1535,8 @@ show_completion_info() {
     fi
 
     # Show MAC address information
-    local STORED_MAC=$(read_existing_mac)
-    echo "Container MAC address: ${STORED_MAC:-unknown}"
+    local STORED_MAC_INFO=$(read_existing_mac)
+    echo "Container MAC address: ${STORED_MAC_INFO:-unknown}"
     echo "  (Stored in ${CONFIG_FILE})"
     echo ""
 
@@ -1608,9 +1607,9 @@ uninstall_service() {
     echo ""
 
     # Find containers with the same name
-    local containers=$(pct list | grep "${CONTAINER_NAME}" | awk '{print $1}' || true)
+    local CONTAINERS=$(pct list | grep "${CONTAINER_NAME}" | awk '{print $1}' || true)
 
-    if [[ -z "$containers" ]]; then
+    if [[ -z "$CONTAINERS" ]]; then
         log_error "No ${CONTAINER_NAME} containers found."
         log_info "Use 'pct list' to see all containers."
         exit 1
@@ -1632,63 +1631,59 @@ uninstall_service() {
     log_info "Starting uninstall process..."
 
     # Get storage and template information from the first container before destroying it
-    local container_storage=""
-    local container_template=""
-    local first_container=$(echo $containers | awk '{print $1}')
-    if [[ -n "$first_container" ]]; then
+    local CONTAINER_STORAGE_INFO=""
+    local CONTAINER_TEMPLATE_INFO=""
+    local FIRST_CONTAINER=$(echo $CONTAINERS | awk '{print $1}')
+    if [[ -n "$FIRST_CONTAINER" ]]; then
         # Extract storage from container config (rootfs line format: "rootfs: storage:size")
-        container_storage=$(pct config "$first_container" | grep '^rootfs:' | cut -d' ' -f2 | cut -d':' -f1)
-        if [[ -n "$container_storage" ]]; then
-            log_info "Detected storage from container: $container_storage"
-        else
-            log_warning "Could not detect storage from container configuration"
+        CONTAINER_STORAGE_INFO=$(pct config "$FIRST_CONTAINER" | grep "^rootfs:" | sed 's/.*: *\([^:]*\):.*/\1/' || true)
+        if [[ -n "$CONTAINER_STORAGE_INFO" ]]; then
+            log_info "Detected storage from container: $CONTAINER_STORAGE_INFO"
         fi
 
         # Try to detect the template by looking at OS info and matching against available templates
         log_info "Attempting to detect template used for container..."
-        local os_info=$(pct exec "$first_container" -- cat /etc/os-release 2>/dev/null | grep '^PRETTY_NAME=' | cut -d'"' -f2 || true)
-        if [[ -n "$os_info" ]]; then
-            log_info "Container OS: $os_info"
+        local OS_INFO=$(pct exec "$FIRST_CONTAINER" -- cat /etc/os-release 2>/dev/null | grep '^PRETTY_NAME=' | cut -d'"' -f2 || true)
+        if [[ -n "$OS_INFO" ]]; then
+            log_info "Container OS: $OS_INFO"
             # Try to find matching Fedora template
-            if [[ "$container_storage" != "" ]]; then
-                container_template=$(pveam list "$container_storage" 2>/dev/null | grep -i fedora | tail -n1 | awk '{print $1}' | cut -d':' -f2 || true)
-                if [[ -n "$container_template" ]]; then
-                    log_info "Detected likely template: $container_template"
+            if [[ "$CONTAINER_STORAGE_INFO" != "" ]]; then
+                CONTAINER_TEMPLATE_INFO=$(pveam list "$CONTAINER_STORAGE_INFO" 2>/dev/null | grep -i fedora | tail -n1 | awk '{print $1}' | cut -d':' -f2 || true)
+                if [[ -n "$CONTAINER_TEMPLATE_INFO" ]]; then
+                    log_info "Detected template: $CONTAINER_TEMPLATE_INFO"
                 else
-                    log_warning "Could not match container OS to a specific template"
+                    log_warning "Could not detect template from storage"
                 fi
             fi
-        else
-            log_warning "Could not determine container OS information"
         fi
     fi
 
     # Process each container
-    for container_id in $containers; do
-        log_info "Processing container $container_id..."
+    for CONTAINER_ID_ITEM in $CONTAINERS; do
+        log_info "Processing container $CONTAINER_ID_ITEM..."
 
         # Stop container if running
-        if pct status "$container_id" | grep -q "running"; then
-            log_info "Stopping container $container_id..."
-            pct stop "$container_id"
+        if pct status "$CONTAINER_ID_ITEM" | grep -q "running"; then
+            log_info "Stopping container $CONTAINER_ID_ITEM..."
+            pct stop "$CONTAINER_ID_ITEM"
         fi
 
         # Destroy container
-        log_info "Destroying container ${CONTAINER_ID}..."
-        pct destroy "${CONTAINER_ID}"
+        log_info "Destroying container $CONTAINER_ID_ITEM..."
+        pct destroy "$CONTAINER_ID_ITEM"
 
         # Remove container firewall file if it exists
-        local FIREWALL_FILE="/etc/pve/firewall/${CONTAINER_ID}.fw"
-        if [[ -f "${FIREWALL_FILE}" ]]; then
+        local FIREWALL_FILE_LOCAL="/etc/pve/firewall/${CONTAINER_ID_ITEM}.fw"
+        if [[ -f "${FIREWALL_FILE_LOCAL}" ]]; then
             log_info "Removing container firewall configuration..."
-            rm -f "${FIREWALL_FILE}"
+            rm -f "${FIREWALL_FILE_LOCAL}"
         fi
 
         # Remove node firewall rule
-        local NODE_FW="/etc/pve/nodes/$(hostname)/host.fw"
-        if [[ -f "${NODE_FW}" ]] && grep -q "quickvm-provider-${HOST_PORT}" "${NODE_FW}"; then
+        local NODE_FW_LOCAL="/etc/pve/nodes/$(hostname)/host.fw"
+        if [[ -f "${NODE_FW_LOCAL}" ]] && grep -q "quickvm-provider-${HOST_PORT}" "${NODE_FW_LOCAL}"; then
             log_info "Removing node firewall rule..."
-            sed -i "/# quickvm-provider-${HOST_PORT}/,+1d" "${NODE_FW}"
+            sed -i "/quickvm-provider-${HOST_PORT}/d" "${NODE_FW_LOCAL}"
         fi
 
         # Remove port forwarding service and helper script
