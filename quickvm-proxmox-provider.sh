@@ -1991,7 +1991,7 @@ create_vm_role() {
         "Datastore.Audit"    # View datastore usage
         "Datastore.AllocateTemplate" # Allocate templates
         "Sys.Modify"      # Modify system settings and use download-url
-        "sys.Audit"        # View system settings
+        "Sys.Audit"        # View system settings
 
         # Pool management (if using resource pools)
         "Pool.Allocate"     # Use resource pools
