@@ -49,6 +49,7 @@ CONTAINER_ID_MANUAL=""
 CONFIG_FILE="/etc/quickvm/quickvm-provider.env"
 SKIP_API_USER=${SKIP_API_USER:-false}
 AUTO_UPDATE=${AUTO_UPDATE:-false}
+INTERFACES=${INTERFACES:-""}
 
 # API key handling
 if [[ -z "${API_KEY:-}" ]]; then
@@ -78,6 +79,60 @@ log_warning() {
 
 log_error() {
     echo "[ERROR] $1"
+}
+
+# Validate specified interfaces exist and have IP addresses
+validate_interfaces() {
+    if [[ -z "${INTERFACES}" ]]; then
+        return 0  # No validation needed if no interfaces specified
+    fi
+
+    log_info "Validating specified interfaces: ${INTERFACES}"
+
+    IFS=',' read -ra INTERFACE_ARRAY <<< "${INTERFACES}"
+    local INVALID_INTERFACES=()
+    local VALID_IPS=()
+
+    for INTERFACE in "${INTERFACE_ARRAY[@]}"; do
+        INTERFACE=$(echo "${INTERFACE}" | xargs)  # trim whitespace
+
+        # Check if interface exists
+        if ! ip link show "${INTERFACE}" >/dev/null 2>&1; then
+            INVALID_INTERFACES+=("${INTERFACE} (does not exist)")
+            continue
+        fi
+
+        # Check if interface has an IP address
+        local IP=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+        if [[ -z "${IP}" ]]; then
+            INVALID_INTERFACES+=("${INTERFACE} (no IP address)")
+            continue
+        fi
+
+        VALID_IPS+=("${INTERFACE}:${IP}")
+        log_info "  ✓ ${INTERFACE}: ${IP}"
+    done
+
+    if [[ ${#INVALID_INTERFACES[@]} -gt 0 ]]; then
+        log_error "Invalid interfaces specified:"
+        for INVALID in "${INVALID_INTERFACES[@]}"; do
+            log_error "  ✗ ${INVALID}"
+        done
+        log_error ""
+        log_error "Available interfaces with IP addresses:"
+        ip addr show | grep -E '^[0-9]+:' | while read LINE; do
+            IFACE=$(echo "${LINE}" | awk -F': ' '{print $2}' | cut -d'@' -f1)
+            if [[ "${IFACE}" != "lo" ]]; then
+                    IP=$(ip addr show "${IFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+                    if [[ -n "${IP}" ]]; then
+                        echo "    ${IFACE}: ${IP}"
+                    fi
+                fi
+        done
+        exit 1
+    fi
+
+    log_success "All specified interfaces are valid and have IP addresses"
 }
 
 # Parse command line arguments
@@ -167,6 +222,47 @@ parse_arguments() {
                     shift
                 fi
                 ;;
+            --interfaces)
+                INTERFACES="$2"
+                shift 2
+                ;;
+            --list-interfaces)
+                echo "Available network interfaces with IP addresses:"
+                echo ""
+
+                # Use array-based approach to avoid pipe/subshell issues
+                local INTERFACE_ARRAY=()
+                while IFS= read -r LINE; do
+                    INTERFACE_ARRAY+=("${LINE}")
+                done < <(ip addr show | grep -E '^[0-9]+:')
+
+                for LINE in "${INTERFACE_ARRAY[@]}"; do
+                    IFACE=$(echo "${LINE}" | awk -F': ' '{print $2}' | cut -d'@' -f1)
+                    if [[ "${IFACE}" != "lo" ]]; then
+                        IP=$(ip addr show "${IFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+                        STATE=$(echo "${LINE}" | grep -o 'state [A-Z]*' | awk '{print $2}' || echo "UNKNOWN")
+
+                        # Check interface flags to provide more intuitive status
+                        if [[ "${STATE}" == "UNKNOWN" ]]; then
+                            FLAGS=$(echo "${LINE}" | grep -o '<[^>]*>')
+                            if [[ "${FLAGS}" =~ UP && "${FLAGS}" =~ LOWER_UP ]]; then
+                                STATE="ACTIVE"
+                            fi
+                        fi
+
+                        if [[ -n "${IP}" ]]; then
+                            printf "  %-15s %s (%s)\n" "${IFACE}" "${IP}" "${STATE}"
+                        else
+                            printf "  %-15s %s (%s)\n" "${IFACE}" "no IP" "${STATE}"
+                        fi
+                    fi
+                done
+
+                echo ""
+                echo "Use --interfaces with a comma-separated list of interface names."
+                echo "Example: --interfaces eno1,defined1"
+                exit 0
+                ;;
             -h|--help)
                 show_usage
                 exit 0
@@ -209,24 +305,25 @@ detect_cluster_config() {
     log_info "Current node: ${CURRENT_NODE}"
 
     # Check if this is a cluster setup
-    local cluster_status=""
+    local CLUSTER_STATUS=""
     if command -v pvesh >/dev/null 2>&1; then
-        cluster_status=$(pvesh get /cluster/status --output-format json 2>/dev/null || echo "[]")
+        CLUSTER_STATUS=$(pvesh get /cluster/status --output-format json 2>/dev/null || echo "[]")
     fi
 
     # Parse cluster nodes and assign node ID
-    local nodes=()
-    if [[ "${cluster_status}" != "[]" ]] && command -v jq >/dev/null 2>&1; then
+    local NODES=()
+    if [[ "${CLUSTER_STATUS}" != "[]" ]] && command -v jq >/dev/null 2>&1; then
         # Parse JSON to get node list
-        while IFS= read -r node; do
-            nodes+=("$node")
-        done < <(echo "${cluster_status}" | jq -r '.[] | select(.type == "node") | .name' 2>/dev/null | sort)
+        while IFS= read -r NODE; do
+            NODES+=("$NODE")
+        done < <(echo "${CLUSTER_STATUS}" | jq -r '.[] | select(.type == "node") | .name' 2>/dev/null | sort)
     fi
 
     # Fallback: try to detect nodes from /etc/pve/nodes if cluster detection fails
-    if [[ ${#nodes[@]} -eq 0 ]] && [[ -d "/etc/pve/nodes" ]]; then
-        while IFS= read -r node; do
-            nodes+=("$node")
+    # Fallback: get node list from filesystem if cluster status is not available
+    if [[ ${#NODES[@]} -eq 0 ]] && [[ -d "/etc/pve/nodes" ]]; then
+        while IFS= read -r NODE; do
+            NODES+=("$NODE")
         done < <(ls /etc/pve/nodes/ 2>/dev/null | sort)
     fi
 
@@ -240,9 +337,9 @@ detect_cluster_config() {
 
     # Find current node's position in sorted list to determine node ID
     NODE_ID=0
-    for i in "${!nodes[@]}"; do
-        if [[ "${nodes[$i]}" == "${CURRENT_NODE}" ]]; then
-            NODE_ID=$i
+    for I in "${!NODES[@]}"; do
+        if [[ "${NODES[$I]}" == "${CURRENT_NODE}" ]]; then
+            NODE_ID=$I
             break
         fi
     done
@@ -253,14 +350,14 @@ detect_cluster_config() {
     log_success "  Port: ${HOST_PORT} (same port on all nodes)"
 
     # Show cluster info for reference
-    if [[ ${#nodes[@]} -gt 1 ]]; then
+    if [[ ${#NODES[@]} -gt 1 ]]; then
         echo ""
-        log_info "Cluster setup detected - ${#nodes[@]} nodes:"
-        for i in "${!nodes[@]}"; do
-            if [[ "${nodes[$i]}" == "${CURRENT_NODE}" ]]; then
-                echo "  ${nodes[$i]} (this node) - port ${HOST_PORT}"
+        log_info "Cluster setup detected - ${#NODES[@]} nodes:"
+        for I in "${!NODES[@]}"; do
+            if [[ "${NODES[$I]}" == "${CURRENT_NODE}" ]]; then
+                echo "  ${NODES[$I]} (this node) - port ${HOST_PORT}"
             else
-                echo "  ${nodes[$i]} - port ${HOST_PORT}"
+                echo "  ${NODES[$I]} - port ${HOST_PORT}"
             fi
         done
         echo ""
@@ -278,17 +375,17 @@ get_latest_fedora_template() {
     pveam update
 
     # Get available templates and find the latest Fedora one
-    local latest_fedora=$(pveam available --section system | grep -i fedora | tail -n1 | awk '{print $2}')
+    local LATEST_FEDORA=$(pveam available --section system | grep -i fedora | tail -n1 | awk '{print $2}')
 
-    if [[ -z "${latest_fedora}" ]]; then
+    if [[ -z "${LATEST_FEDORA}" ]]; then
         log_error "No Fedora templates found in available templates"
         log_info "Available system templates:"
         pveam available --section system | head -10
         exit 1
     fi
 
-    TEMPLATE_NAME="${latest_fedora}"
-    log_success "Selected Fedora template: ${TEMPLATE_NAME}"
+    TEMPLATE_NAME="${LATEST_FEDORA}"
+    log_success "Latest Fedora template found: ${TEMPLATE_NAME}"
 }
 
 # Check for existing containers with the same name
@@ -296,10 +393,10 @@ check_existing_containers() {
     log_info "Checking for existing ${CONTAINER_NAME} containers..."
 
     # Find containers with the same name
-    local containers=$(pct list | grep "${CONTAINER_NAME}" | awk '{print $1}' || true)
+    local CONTAINERS=$(pct list | grep "${CONTAINER_NAME}" | awk '{print $1}' || true)
 
-    if [[ -n "$containers" ]]; then
-        log_error "Existing ${CONTAINER_NAME} container(s) found with ID(s): $containers"
+    if [[ -n "${CONTAINERS}" ]]; then
+        log_error "Existing ${CONTAINER_NAME} container(s) found with ID(s): ${CONTAINERS}"
         echo ""
         log_error "A ${CONTAINER_NAME} container already exists on this system."
         log_info "To avoid conflicts, only one ${CONTAINER_NAME} container is allowed per host."
@@ -350,8 +447,8 @@ validate_static_ip() {
 
 # Check if storage supports specific content types
 check_storage_content_support() {
-    local storage_name="$1"
-    local required_content="$2"
+    local STORAGE_NAME="$1"
+    local REQUIRED_CONTENT="$2"
 
     # First check if storage is active using pvesm status
     local storage_info=$(pvesm status | grep "^${storage_name}")
@@ -406,16 +503,16 @@ check_storage_content_support() {
         return 1  # Storage is disabled
     fi
 
-    if [[ -z "${storage_block}" || "${storage_block}" == "NO_CONTENT" ]]; then
-        log_warning "Could not find content configuration for storage '${storage_name}'"
+    if [[ -z "${STORAGE_BLOCK}" || "${STORAGE_BLOCK}" == "NO_CONTENT" ]]; then
+        log_warning "Could not find content configuration for storage '${STORAGE_NAME}'"
         return 1  # Fail if we can't determine (don't assume supported)
     fi
 
-    # Check if the required content type is in the comma-separated list
-    if echo "${storage_block}" | grep -q "\b${required_content}\b"; then
+    # Check if the required content type is in the content string
+    if [[ "${STORAGE_BLOCK}" =~ ${REQUIRED_CONTENT} ]]; then
         return 0  # Content type is supported
     else
-        return 1  # Content type is not supported
+        return 1  # Content type not supported
     fi
 }
 
@@ -426,11 +523,11 @@ show_storage_debug_info() {
 
     # Show pvesm status output
     log_info "Active storage from 'pvesm status':"
-    pvesm status | grep "active" | while read -r line; do
-        local storage_name=$(echo "$line" | awk '{print $1}')
-        local storage_type=$(echo "$line" | awk '{print $2}')
-        local storage_avail=$(echo "$line" | awk '{print $6}')
-        echo "  ${storage_name} (${storage_type}) - Available: ${storage_avail}"
+    pvesm status | grep "active" | while read -r LINE; do
+        local STORAGE_NAME=$(echo "$LINE" | awk '{print $1}')
+        local STORAGE_TYPE=$(echo "$LINE" | awk '{print $2}')
+        local STORAGE_AVAIL=$(echo "$LINE" | awk '{print $6}')
+        echo "  ${STORAGE_NAME} (${STORAGE_TYPE}) - Available: ${STORAGE_AVAIL}"
     done
     echo ""
 
@@ -470,23 +567,23 @@ show_storage_debug_info() {
 
     # Check specific content type support for active storage
     log_info "Container support (rootdir) check:"
-    pvesm status | grep "active" | while read -r line; do
-        local storage_name=$(echo "$line" | awk '{print $1}')
-        if check_storage_content_support "${storage_name}" "rootdir"; then
-            echo "  ✓ ${storage_name} supports containers"
+    pvesm status | grep "active" | while read -r LINE; do
+        local STORAGE_NAME=$(echo "$LINE" | awk '{print $1}')
+        if check_storage_content_support "${STORAGE_NAME}" "rootdir"; then
+            echo "  ✓ ${STORAGE_NAME} supports containers"
         else
-            echo "  ✗ ${storage_name} does not support containers"
+            echo "  ✗ ${STORAGE_NAME} does not support containers"
         fi
     done
     echo ""
 
     log_info "Template support (vztmpl) check:"
-    pvesm status | grep "active" | while read -r line; do
-        local storage_name=$(echo "$line" | awk '{print $1}')
-        if check_storage_content_support "${storage_name}" "vztmpl"; then
-            echo "  ✓ ${storage_name} supports templates"
+    pvesm status | grep "active" | while read -r LINE; do
+        local STORAGE_NAME=$(echo "$LINE" | awk '{print $1}')
+        if check_storage_content_support "${STORAGE_NAME}" "vztmpl"; then
+            echo "  ✓ ${STORAGE_NAME} supports templates"
         else
-            echo "  ✗ ${storage_name} does not support templates"
+            echo "  ✗ ${STORAGE_NAME} does not support templates"
         fi
     done
     echo ""
@@ -743,27 +840,28 @@ create_host_directories() {
 # Create LXC container
 create_container() {
     # Get MAC address for container
-    local mac_address=$(get_mac_address)
+    local MAC_ADDRESS=$(get_mac_address)
 
     # Log MAC address information
-    local existing_mac=$(read_existing_mac)
-    if [[ -n "${existing_mac}" ]]; then
-        log_info "Using existing MAC address: ${mac_address}"
+    local EXISTING_MAC=$(read_existing_mac)
+    if [[ -n "${EXISTING_MAC}" ]]; then
+        log_info "Using existing MAC address: ${MAC_ADDRESS}"
     else
-        log_info "Generated new MAC address: ${mac_address}"
+        log_info "Generated new MAC address: ${MAC_ADDRESS}"
     fi
 
-    # Record MAC address on host before creating container
-    record_mac_address "${mac_address}"
+    # Store MAC address for future use
+    store_mac_address "${MAC_ADDRESS}"
 
     # Determine network configuration
     local net_config=""
+    # Create container with dynamic network configuration
     if [[ -n "${IP_ADDRESS}" && -n "${GATEWAY}" ]]; then
-        net_config="name=eth0,bridge=${BRIDGE},gw=${GATEWAY},ip=${IP_ADDRESS},firewall=1,hwaddr=${mac_address}"
+        net_config="name=eth0,bridge=${BRIDGE},gw=${GATEWAY},ip=${IP_ADDRESS},firewall=1,hwaddr=${MAC_ADDRESS}"
         log_info "Creating LXC container with ID ${CONTAINER_ID} using static IP ${IP_ADDRESS}..."
     else
-        net_config="name=eth0,bridge=${BRIDGE},ip=dhcp,firewall=1,hwaddr=${mac_address}"
-        log_info "Creating LXC container with ID ${CONTAINER_ID} using DHCP with MAC ${mac_address}..."
+        net_config="name=eth0,bridge=${BRIDGE},ip=dhcp,firewall=1,hwaddr=${MAC_ADDRESS}"
+        log_info "Creating LXC container with ID ${CONTAINER_ID} using DHCP with MAC ${MAC_ADDRESS}..."
     fi
 
     # Create container with bridged networking
@@ -852,68 +950,68 @@ configure_node_access() {
     log_info "Configuring Proxmox node access for port ${HOST_PORT}..."
 
     # Get container IP address for reference
-    local container_ip=""
-    local max_attempts=10
-    local attempt=1
+    local CONTAINER_IP=""
+    local MAX_ATTEMPTS=10
+    local ATTEMPT=1
 
-    while [[ -z "${container_ip}" && $attempt -le $max_attempts ]]; do
-        container_ip=$(pct exec "${CONTAINER_ID}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
-        if [[ -z "${container_ip}" ]]; then
-            log_info "Waiting for container IP... (attempt $attempt/$max_attempts)"
+    while [[ -z "${CONTAINER_IP}" && $ATTEMPT -le $MAX_ATTEMPTS ]]; do
+        CONTAINER_IP=$(pct exec "${CONTAINER_ID}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true)
+        if [[ -z "${CONTAINER_IP}" ]]; then
+            log_info "Waiting for container IP... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
             sleep 2
-            ((attempt++))
+            ((ATTEMPT++))
         fi
     done
 
-    if [[ -z "${container_ip}" ]]; then
+    if [[ -z "${CONTAINER_IP}" ]]; then
         log_warning "Could not determine container IP address - skipping node access configuration"
         return 0
     fi
 
-    log_info "Container IP: ${container_ip}"
+    log_info "Container IP: ${CONTAINER_IP}"
 
     # Create firewall directory if it doesn't exist
     mkdir -p /etc/pve/firewall
 
     # Create node-specific firewall rules to allow access to the port
-    local node_fw_file="/etc/pve/nodes/${CURRENT_NODE}/host.fw"
+    local NODE_FW_FILE="/etc/pve/nodes/${CURRENT_NODE}/host.fw"
 
     # Backup existing firewall file if it exists
-    if [[ -f "${node_fw_file}" ]]; then
-        cp "${node_fw_file}" "${node_fw_file}.backup.$(date +%Y%m%d_%H%M%S)"
+    if [[ -f "${NODE_FW_FILE}" ]]; then
+        cp "${NODE_FW_FILE}" "${NODE_FW_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
         log_info "Backed up existing node firewall configuration"
     fi
 
     log_info "Configuring node firewall to allow access to port ${HOST_PORT}"
 
     # Check if our rule already exists
-    local rule_exists=false
-    if [[ -f "${node_fw_file}" ]] && grep -q "quickvm-provider-${HOST_PORT}" "${node_fw_file}"; then
-        rule_exists=true
+    local RULE_EXISTS=false
+    if [[ -f "${NODE_FW_FILE}" ]] && grep -q "quickvm-provider-${HOST_PORT}" "${NODE_FW_FILE}"; then
+        RULE_EXISTS=true
         log_info "Node access rule already exists, updating..."
     fi
 
     # Create or update the firewall configuration
-    if [[ "${rule_exists}" == "true" ]]; then
+    if [[ "${RULE_EXISTS}" == "true" ]]; then
         # Update existing rule by removing old one and adding new one
-        sed -i "/# quickvm-provider-${HOST_PORT}/,+1d" "${node_fw_file}"
+        sed -i "/# quickvm-provider-${HOST_PORT}/,+1d" "${NODE_FW_FILE}"
     fi
 
     # Add the node access rule
     {
-        if [[ ! -f "${node_fw_file}" ]] || ! grep -q "^\[OPTIONS\]" "${node_fw_file}"; then
+        if [[ ! -f "${NODE_FW_FILE}" ]] || ! grep -q "^\[OPTIONS\]" "${NODE_FW_FILE}"; then
             echo "[OPTIONS]"
             echo "enable: 1"
             echo ""
         fi
 
-        if ! grep -q "^\[RULES\]" "${node_fw_file}" 2>/dev/null; then
+        if ! grep -q "^\[RULES\]" "${NODE_FW_FILE}" 2>/dev/null; then
             echo "[RULES]"
         fi
 
         echo "# quickvm-provider-${HOST_PORT}"
         echo "IN ACCEPT -p tcp --dport ${HOST_PORT} -source +management"
-    } >> "${node_fw_file}"
+    } >> "${NODE_FW_FILE}"
 
     # Setup port forwarding using iptables (persistent approach)
     log_info "Setting up persistent port forwarding..."
@@ -931,7 +1029,7 @@ CONTAINER_NAME="quickvm-provider"
 get_container_ip() {
     local container_id=$(pct list | grep "${CONTAINER_NAME}" | awk '{print $1}' | head -n1)
     if [[ -n "${container_id}" ]]; then
-        pct exec "${container_id}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1
+        pct exec "${container_id}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true
     fi
 }
 
@@ -944,24 +1042,50 @@ get_port() {
     fi
 }
 
-# Function to get cluster/management IP from Proxmox network config
-get_cluster_ip() {
-    # Get the IP from vmbr0 bridge (main cluster interface)
-    local cluster_ip=$(pvesh get /nodes/$(hostname)/network --output-format json 2>/dev/null | \
-        jq -r '.[] | select(.iface == "vmbr0" and .address != null) | .address' 2>/dev/null | head -n1)
+# Function to get IPs from specified interfaces or auto-detect
+get_forwarding_ips() {
+    local INTERFACES=""
 
-    # Fallback: get IP from hostname resolution
-    if [[ -z "${cluster_ip}" || "${cluster_ip}" == "null" ]]; then
-        cluster_ip=$(hostname -I | awk '{print $1}')
+    # Read interfaces from config file
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        INTERFACES=$(grep "^INTERFACES=" "${CONFIG_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
     fi
 
-    echo "${cluster_ip}"
+    # If no interfaces specified, use legacy behavior (vmbr0 or hostname -I)
+    if [[ -z "${INTERFACES}" ]]; then
+        local CLUSTER_IP=$(pvesh get /nodes/$(hostname)/network --output-format json 2>/dev/null | \
+            jq -r '.[] | select(.iface == "vmbr0" and .address != null) | .address' 2>/dev/null | head -n1)
+
+        if [[ -z "${CLUSTER_IP}" || "${CLUSTER_IP}" == "null" ]]; then
+            CLUSTER_IP=$(hostname -I | awk '{print $1}')
+        fi
+
+        echo "${CLUSTER_IP}"
+        return
+    fi
+
+    # Get IPs from specified interfaces
+    local IP_LIST=""
+    IFS=',' read -ra INTERFACE_ARRAY <<< "${INTERFACES}"
+    for INTERFACE in "${INTERFACE_ARRAY[@]}"; do
+        INTERFACE=$(echo "${INTERFACE}" | xargs)  # trim whitespace
+        local IP=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+        if [[ -n "${IP}" ]]; then
+            if [[ -n "${IP_LIST}" ]]; then
+                IP_LIST="${IP_LIST},${IP}"
+            else
+                IP_LIST="${IP}"
+            fi
+        fi
+    done
+
+    echo "${IP_LIST}"
 }
 
 # Get current values
 CONTAINER_IP=$(get_container_ip)
 PORT=$(get_port)
-CLUSTER_IP=$(get_cluster_ip)
+FORWARDING_IPS=$(get_forwarding_ips)
 
 if [[ -z "${CONTAINER_IP}" ]]; then
     echo "Error: Could not determine container IP address"
@@ -973,30 +1097,46 @@ if [[ -z "${PORT}" ]]; then
     exit 1
 fi
 
-if [[ -z "${CLUSTER_IP}" ]]; then
-    echo "Error: Could not determine cluster IP address"
+if [[ -z "${FORWARDING_IPS}" ]]; then
+    echo "Error: Could not determine forwarding IP addresses"
     exit 1
 fi
 
-echo "Setting up port forwarding: ${CLUSTER_IP}:${PORT} -> ${CONTAINER_IP}:${PORT}"
+echo "Setting up port forwarding: ${FORWARDING_IPS}:${PORT} -> ${CONTAINER_IP}:${PORT}"
 
 case "$1" in
     start)
-        # Add DNAT rule scoped to cluster IP if it doesn't exist
-        iptables -t nat -C PREROUTING -d ${CLUSTER_IP} -p tcp --dport ${PORT} -j DNAT --to-destination ${CONTAINER_IP}:${PORT} 2>/dev/null || \
-        iptables -t nat -A PREROUTING -d ${CLUSTER_IP} -p tcp --dport ${PORT} -j DNAT --to-destination ${CONTAINER_IP}:${PORT}
+        # Add DNAT rules for each forwarding IP
+        IFS=',' read -ra IP_ARRAY <<< "${FORWARDING_IPS}"
+        for IP in "${IP_ARRAY[@]}"; do
+            IP=$(echo "${IP}" | xargs)  # trim whitespace
+            echo "Adding forwarding rule for ${IP}:${PORT} -> ${CONTAINER_IP}:${PORT}"
 
-        # Add MASQUERADE rule if it doesn't exist
-        iptables -t nat -C POSTROUTING -p tcp -d ${CONTAINER_IP} --dport ${PORT} -j MASQUERADE 2>/dev/null || \
-        iptables -t nat -A POSTROUTING -p tcp -d ${CONTAINER_IP} --dport ${PORT} -j MASQUERADE
+            # Add DNAT rule scoped to this IP if it doesn't exist
+            iptables -t nat -C PREROUTING -d "${IP}" -p tcp --dport "${PORT}" -j DNAT --to-destination "${CONTAINER_IP}:${PORT}" 2>/dev/null || \
+            iptables -t nat -A PREROUTING -d "${IP}" -p tcp --dport "${PORT}" -j DNAT --to-destination "${CONTAINER_IP}:${PORT}"
+        done
+
+        # Add MASQUERADE rule if it doesn't exist (only need one)
+        iptables -t nat -C POSTROUTING -p tcp -d "${CONTAINER_IP}" --dport "${PORT}" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -p tcp -d "${CONTAINER_IP}" --dport "${PORT}" -j MASQUERADE
         ;;
     stop)
-        # Remove rules (ignore errors if rules don't exist)
-        iptables -t nat -D PREROUTING -d ${CLUSTER_IP} -p tcp --dport ${PORT} -j DNAT --to-destination ${CONTAINER_IP}:${PORT} 2>/dev/null || true
-        iptables -t nat -D POSTROUTING -p tcp -d ${CONTAINER_IP} --dport ${PORT} -j MASQUERADE 2>/dev/null || true
+        # Remove rules for each forwarding IP
+        IFS=',' read -ra IP_ARRAY <<< "${FORWARDING_IPS}"
+        for IP in "${IP_ARRAY[@]}"; do
+            IP=$(echo "${IP}" | xargs)  # trim whitespace
+            echo "Removing forwarding rule for ${IP}:${PORT} -> ${CONTAINER_IP}:${PORT}"
+
+            # Remove DNAT rule (ignore errors if rules don't exist)
+            iptables -t nat -D PREROUTING -d "${IP}" -p tcp --dport "${PORT}" -j DNAT --to-destination "${CONTAINER_IP}:${PORT}" 2>/dev/null || true
+        done
+
+        # Remove MASQUERADE rule (ignore errors if rule doesn't exist)
+        iptables -t nat -D POSTROUTING -p tcp -d "${CONTAINER_IP}" --dport "${PORT}" -j MASQUERADE 2>/dev/null || true
         ;;
     *)
-        echo "Usage: $0 {start|stop}"
+        echo "Usage: ${0} {start|stop}"
         exit 1
         ;;
 esac
@@ -1033,7 +1173,27 @@ EOF
         if pve-firewall compile 2>/dev/null; then
             systemctl reload pve-firewall
             log_success "Node access configured for port ${HOST_PORT}"
-            log_success "Port forwarding active: ${CURRENT_NODE}:${HOST_PORT} -> ${container_ip}:${HOST_PORT}"
+
+            # Show which interfaces are being used for port forwarding
+            if [[ -n "${INTERFACES}" ]]; then
+                # Get the actual IPs for the specified interfaces
+                local FORWARDING_DETAILS=""
+                IFS=',' read -ra INTERFACE_ARRAY <<< "${INTERFACES}"
+                for INTERFACE in "${INTERFACE_ARRAY[@]}"; do
+                    INTERFACE=$(echo "${INTERFACE}" | xargs)  # trim whitespace
+                    local IP=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+                    if [[ -n "${IP}" ]]; then
+                        if [[ -n "${FORWARDING_DETAILS}" ]]; then
+                            FORWARDING_DETAILS="${FORWARDING_DETAILS}, ${INTERFACE}:${IP}"
+                        else
+                            FORWARDING_DETAILS="${INTERFACE}:${IP}"
+                        fi
+                    fi
+                done
+                log_success "Port forwarding active on specified interfaces: ${FORWARDING_DETAILS}:${HOST_PORT} -> ${CONTAINER_IP}:${HOST_PORT}"
+            else
+                log_success "Port forwarding active: ${CURRENT_NODE}:${HOST_PORT} -> ${CONTAINER_IP}:${HOST_PORT}"
+            fi
         else
             log_warning "Firewall compilation had warnings - but port forwarding should still work"
         fi
@@ -1062,17 +1222,17 @@ update_environment_for_host_network() {
         log_info "Existing environment file with full configuration found, preserving user configuration..."
 
         # Get current MAC address from host config
-        local current_mac=$(read_existing_mac)
+        local CURRENT_MAC=$(read_existing_mac)
 
         # Update only essential values, preserving other configuration
-        if [[ -n "${current_mac}" ]]; then
+        if [[ -n "${CURRENT_MAC}" ]]; then
             pct exec "${CONTAINER_ID}" -- bash -c "
                 # Create backup of existing config
                 cp /etc/quickvm/quickvm-provider.env /etc/quickvm/quickvm-provider.env.backup
 
                 # Update or add essential values while preserving others
                 sed -i '/^MAC=/d' /etc/quickvm/quickvm-provider.env
-                echo 'MAC=${current_mac}' >> /etc/quickvm/quickvm-provider.env
+                echo 'MAC=${CURRENT_MAC}' >> /etc/quickvm/quickvm-provider.env
 
                 # Update API_KEY if it doesn't exist
                 if ! grep -q '^API_KEY=' /etc/quickvm/quickvm-provider.env; then
@@ -1083,13 +1243,19 @@ update_environment_for_host_network() {
                 if ! grep -q '^PORT=' /etc/quickvm/quickvm-provider.env; then
                     echo 'PORT=${HOST_PORT}' >> /etc/quickvm/quickvm-provider.env
                 fi
+
+                # Update INTERFACES if specified
+                if [[ -n '${INTERFACES}' ]]; then
+                    sed -i '/^INTERFACES=/d' /etc/quickvm/quickvm-provider.env
+                    echo 'INTERFACES=${INTERFACES}' >> /etc/quickvm/quickvm-provider.env
+                fi
             "
         fi
 
         # Read back the API key that's actually in the file to update our global variable
-        local existing_api_key=$(grep "^API_KEY=" /etc/quickvm/quickvm-provider.env | cut -d'=' -f2 | tr -d ' ')
-        if [[ -n "${existing_api_key}" ]]; then
-            API_KEY="${existing_api_key}"
+        local EXISTING_API_KEY=$(grep "^API_KEY=" /etc/quickvm/quickvm-provider.env | cut -d'=' -f2 | tr -d ' ')
+        if [[ -n "${EXISTING_API_KEY}" ]]; then
+            API_KEY="${EXISTING_API_KEY}"
             API_KEY_WAS_GENERATED=false
             log_info "Using existing API key from configuration file"
         fi
@@ -1097,16 +1263,16 @@ update_environment_for_host_network() {
         log_info "Preserved existing configuration, updated essential values only"
     else
         # Create new environment file with all default values (or replace minimal config)
-        local current_mac=$(read_existing_mac)
-        local existing_api_key=""
+        local CURRENT_MAC=$(read_existing_mac)
+        local EXISTING_API_KEY=""
 
         # Check if there's an existing API key in a minimal config file before replacing it
         if pct exec "${CONTAINER_ID}" -- test -f /etc/quickvm/quickvm-provider.env; then
             log_info "Found minimal configuration file, checking for existing API key..."
-            existing_api_key=$(grep "^API_KEY=" /etc/quickvm/quickvm-provider.env 2>/dev/null | cut -d'=' -f2 | tr -d ' ' || true)
-            if [[ -n "${existing_api_key}" ]]; then
+            EXISTING_API_KEY=$(grep "^API_KEY=" /etc/quickvm/quickvm-provider.env 2>/dev/null | cut -d'=' -f2 | tr -d ' ' || true)
+            if [[ -n "${EXISTING_API_KEY}" ]]; then
                 log_info "Found existing API key in minimal config, preserving it..."
-                API_KEY="${existing_api_key}"
+                API_KEY="${EXISTING_API_KEY}"
                 API_KEY_WAS_GENERATED=false
             fi
             log_info "Replacing minimal configuration with full default configuration..."
@@ -1122,10 +1288,15 @@ WORKERS=4
 TLS_GENERATE_SELF_SIGNED=true
 TLS_CERT_SUBJECT=/C=US/ST=IL/L=Chicago/O=QuickVM/CN=quickvm-provider
 PORT=${HOST_PORT}
-MAC=${current_mac}
+MAC=${CURRENT_MAC}
 EOF"
 
-        if [[ -n "${existing_api_key}" ]]; then
+        # Add INTERFACES line separately if specified
+        if [[ -n "${INTERFACES}" ]]; then
+            pct exec "${CONTAINER_ID}" -- bash -c "echo 'INTERFACES=${INTERFACES}' >> /etc/quickvm/quickvm-provider.env"
+        fi
+
+        if [[ -n "${EXISTING_API_KEY}" ]]; then
             log_info "Preserved existing API key from previous configuration"
         else
             log_info "Created environment file with new API key"
@@ -1250,14 +1421,14 @@ check_service_status() {
 # Show completion information
 show_completion_info() {
     # Get container IP address
-    local container_ip=""
+    local CONTAINER_IP=""
 
     # Try to get container IP from pct exec
-    if container_ip=$(pct exec "${CONTAINER_ID}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1); then
-        log_info "Container has IP address: ${container_ip}"
+    if CONTAINER_IP=$(pct exec "${CONTAINER_ID}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true) && [[ -n "${CONTAINER_IP}" ]]; then
+        log_info "Container has IP address: ${CONTAINER_IP}"
     else
         log_warning "Could not determine container IP address"
-        container_ip="<container-ip>"
+        CONTAINER_IP="<container-ip>"
     fi
 
     echo ""
@@ -1265,17 +1436,36 @@ show_completion_info() {
     echo ""
     echo "Container ID: ${CONTAINER_ID}"
     echo "Container Name: ${CONTAINER_NAME}"
-    echo "Container IP: ${container_ip}"
+    echo "Container IP: ${CONTAINER_IP}"
+    echo "MAC Address: ${STORED_MAC}"
     echo "Node: ${CURRENT_NODE}"
     echo "Node ID: ${NODE_ID}"
-    echo "Service URL (via container): https://${container_ip}:${HOST_PORT}"
-    echo "Service URL (via Proxmox node): https://$(hostname -I | awk '{print $1}'):${HOST_PORT}"
-    echo ""
-    echo "Port forwarding configured: ${CURRENT_NODE}:${HOST_PORT} -> container:${HOST_PORT}"
-    echo "Service is accessible both directly via container IP and through the Proxmox node"
+    echo "Service URL (via container): https://${CONTAINER_IP}:${HOST_PORT}"
+
+    # Show interface-specific URLs if interfaces are configured
+    if [[ -n "${INTERFACES}" ]]; then
+        echo ""
+        echo "Service URLs (via configured interfaces):"
+        IFS=',' read -ra INTERFACE_ARRAY <<< "${INTERFACES}"
+        for INTERFACE in "${INTERFACE_ARRAY[@]}"; do
+            INTERFACE=$(echo "${INTERFACE}" | xargs)  # trim whitespace
+            local IP=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+            if [[ -n "${IP}" ]]; then
+                echo "  ${INTERFACE}: https://${IP}:${HOST_PORT}"
+            fi
+        done
+        echo ""
+        echo "Port forwarding configured for interfaces: ${INTERFACES}"
+        echo "Service is accessible via specified interfaces and directly via container IP"
+    else
+        echo "Service URL (via Proxmox node): https://$(hostname -I | awk '{print $1}'):${HOST_PORT}"
+        echo ""
+        echo "Port forwarding configured: ${CURRENT_NODE}:${HOST_PORT} -> container:${HOST_PORT}"
+        echo "Service is accessible both directly via container IP and through the Proxmox node"
+    fi
     echo ""
     echo "Test the service health endpoint:"
-    echo "  curl -s https://${container_ip}:${HOST_PORT}/health --insecure"
+    echo "  curl -s https://${CONTAINER_IP}:${HOST_PORT}/health --insecure"
     echo "  curl -s https://$(hostname -I | awk '{print $1}'):${HOST_PORT}/health --insecure"
     echo ""
     echo "To check service status:"
@@ -1346,19 +1536,19 @@ show_completion_info() {
     fi
 
     # Show MAC address information
-    local stored_mac=$(read_existing_mac)
-    echo "Container MAC address: ${stored_mac:-unknown}"
+    local STORED_MAC=$(read_existing_mac)
+    echo "Container MAC address: ${STORED_MAC:-unknown}"
     echo "  (Stored in ${CONFIG_FILE})"
     echo ""
 
     # Add DHCP reservation info if using DHCP
     if [[ -z "${IP_ADDRESS}" || -z "${GATEWAY}" ]]; then
         log_info "DHCP CONFIGURATION:"
-        echo "The container uses DHCP with a consistent MAC address (${stored_mac:-unknown})"
+        echo "The container uses DHCP with a consistent MAC address (${STORED_MAC:-unknown})"
         echo "to ensure it receives the same IP address on each restart."
         echo ""
         echo "For a permanent IP assignment, configure your DHCP server"
-        echo "(router/firewall) to reserve IP ${container_ip} for MAC ${stored_mac:-unknown}."
+        echo "(router/firewall) to reserve IP ${CONTAINER_IP} for MAC ${STORED_MAC:-unknown}."
         echo ""
     fi
 }
@@ -1484,30 +1674,30 @@ uninstall_service() {
         fi
 
         # Destroy container
-        log_info "Destroying container $container_id..."
-        pct destroy "$container_id"
+        log_info "Destroying container ${CONTAINER_ID}..."
+        pct destroy "${CONTAINER_ID}"
 
         # Remove container firewall file if it exists
-        local firewall_file="/etc/pve/firewall/${container_id}.fw"
-        if [[ -f "$firewall_file" ]]; then
+        local FIREWALL_FILE="/etc/pve/firewall/${CONTAINER_ID}.fw"
+        if [[ -f "${FIREWALL_FILE}" ]]; then
             log_info "Removing container firewall configuration..."
-            rm -f "$firewall_file"
+            rm -f "${FIREWALL_FILE}"
         fi
 
         # Remove node firewall rule
-        local node_fw="/etc/pve/nodes/$(hostname)/host.fw"
-        if [[ -f "$node_fw" ]] && grep -q "quickvm-provider-${HOST_PORT}" "$node_fw"; then
+        local NODE_FW="/etc/pve/nodes/$(hostname)/host.fw"
+        if [[ -f "${NODE_FW}" ]] && grep -q "quickvm-provider-${HOST_PORT}" "${NODE_FW}"; then
             log_info "Removing node firewall rule..."
-            sed -i "/# quickvm-provider-${HOST_PORT}/,+1d" "$node_fw"
+            sed -i "/# quickvm-provider-${HOST_PORT}/,+1d" "${NODE_FW}"
         fi
 
         # Remove port forwarding service and helper script
-        local port_service="quickvm-port-forward.service"
-        if systemctl is-enabled "$port_service" >/dev/null 2>&1; then
+        local PORT_SERVICE="quickvm-port-forward.service"
+        if systemctl is-enabled "${PORT_SERVICE}" >/dev/null 2>&1; then
             log_info "Removing port forwarding service..."
-            systemctl stop "$port_service" 2>/dev/null || true
-            systemctl disable "$port_service" 2>/dev/null || true
-            rm -f "/etc/systemd/system/$port_service"
+            systemctl stop "${PORT_SERVICE}" 2>/dev/null || true
+            systemctl disable "${PORT_SERVICE}" 2>/dev/null || true
+            rm -f "/etc/systemd/system/${PORT_SERVICE}"
             rm -f "/usr/local/bin/quickvm-port-forward.sh"
             systemctl daemon-reload
         fi
@@ -1556,14 +1746,17 @@ uninstall_service() {
 
 # Main execution
 main() {
+    # Parse command line arguments first (which may exit for --list-interfaces)
+    parse_arguments "$@"
+
     echo "=== QuickVM Proxmox Provider Setup ==="
     echo ""
 
-    # Parse command line arguments
-    parse_arguments "$@"
-
     # Validate static IP configuration
     validate_static_ip
+
+    # Validate interface configuration
+    validate_interfaces
 
     # Detect and validate storage
     detect_storage
@@ -1595,6 +1788,11 @@ main() {
     log_info "API Key: ${API_KEY}"
     log_info "Bridge: ${BRIDGE}"
     log_info "Host Port: ${HOST_PORT}"
+    if [[ -n "${INTERFACES}" ]]; then
+        log_info "Port Forwarding Interfaces: ${INTERFACES}"
+    else
+        log_info "Port Forwarding Interfaces: auto-detect"
+    fi
     log_info "Image Tag: ${IMAGE_TAG}"
     log_info "Auto Update: ${AUTO_UPDATE}"
     echo ""
@@ -1655,6 +1853,8 @@ show_usage() {
     echo "  -b, --bridge NAME        Network bridge to use (default: vmbr0)"
     echo "  -p, --port PORT          Port on Proxmox host (default: 8071)"
     echo "  -t, --tag TAG            Container image tag (default: stable)"
+    echo "      --interfaces LIST    Comma-separated list of interfaces for port forwarding (default: auto-detect)"
+    echo "      --list-interfaces    Show available network interfaces and their IP addresses"
     echo "  -h, --help               Show this help message"
     echo "      --debug              Enable debug mode (leave container on failure for debugging)"
     echo "      --debug-storage      Show storage configuration debug information and exit"
@@ -1676,6 +1876,7 @@ show_usage() {
     echo "  DEBUG            - Enable debug mode (true/false)"
     echo "  SKIP_API_USER    - Skip API user creation (true/false)"
     echo "  AUTO_UPDATE      - Enable automatic container updates (true/false)"
+    echo "  INTERFACES       - Comma-separated list of interfaces for port forwarding"
     echo ""
     echo "Examples:"
     echo "  $0                                    # Use all defaults with auto-detected storage and DHCP"
@@ -1686,6 +1887,8 @@ show_usage() {
     echo "  $0 -s local-lvm --template-storage local --cpu 4  # Separate storage for containers and templates"
     echo "  $0 -k myapikey123 -b vmbr1           # Custom API key and bridge"
     echo "  $0 -t latest                         # Use latest image tag instead of default"
+    echo "  $0 --interfaces eno1,defined1        # Forward traffic only from specific interfaces"
+    echo "  $0 --list-interfaces                 # Show available network interfaces"
     echo "  $0 --debug                           # Enable debug mode (leaves container running on failure)"
     echo "  $0 --skip-api-user                   # Skip API user creation"
     echo "  $0 --auto-update                     # Enable automatic container updates (defaults to true)"
@@ -1694,12 +1897,13 @@ show_usage() {
     echo "  IP=192.168.1.100/24 GATEWAY=192.168.1.1 $0  # Environment variables for static IP"
     echo "  TEMPLATE_STORAGE=local $0             # Use environment variable for template storage"
     echo "  AUTO_UPDATE=true $0                  # Enable auto-updates via environment variable"
+    echo "  INTERFACES=eno1,defined1 $0          # Use environment variable for interface selection"
     echo "  $0 --uninstall                       # Uninstall the service and clean up"
     echo ""
     echo "Current quickvm-provider containers:"
-    local quickvm_containers=$(pct list | grep "${CONTAINER_NAME}" | awk '{print $1 " (" $2 ")"}'|| true)
-    if [[ -n "$quickvm_containers" ]]; then
-        echo "  $quickvm_containers"
+    local QUICKVM_CONTAINERS=$(pct list | grep "${CONTAINER_NAME}" | awk '{print $1 " (" $2 ")"}'|| true)
+    if [[ -n "${QUICKVM_CONTAINERS}" ]]; then
+        echo "  ${QUICKVM_CONTAINERS}"
     else
         echo "  None found"
     fi
@@ -1709,34 +1913,35 @@ show_usage() {
 # Function to read existing MAC address from config file
 read_existing_mac() {
     if [[ -f "${CONFIG_FILE}" ]]; then
-        local existing_mac=$(grep "^MAC=" "${CONFIG_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
+        local EXISTING_MAC=$(grep "^MAC=" "${CONFIG_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
         # Validate MAC address format before returning it
-        if [[ -n "${existing_mac}" && "${existing_mac}" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
-            echo "${existing_mac}"
+        if [[ -n "${EXISTING_MAC}" && "${EXISTING_MAC}" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
+            echo "${EXISTING_MAC}"
         fi
     fi
 }
 
 # Function to generate or retrieve MAC address
 get_mac_address() {
-    local existing_mac=$(read_existing_mac)
+    local EXISTING_MAC=$(read_existing_mac)
 
-    if [[ -n "${existing_mac}" ]]; then
-        echo "${existing_mac}"
+    if [[ -n "${EXISTING_MAC}" ]]; then
+        echo "${EXISTING_MAC}"
     else
         # Generate a random MAC address with VMware OUI (00:50:56)
-        local mac="00:50:56:$(printf "%02x:%02x:%02x" $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))"
-        echo "${mac}"
+        local MAC="00:50:56:$(printf "%02x:%02x:%02x" $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))"
+        echo "${MAC}"
     fi
 }
 
 # Function to record MAC address in config file
-record_mac_address() {
-    local mac_address="$1"
+# Store MAC address in config file
+store_mac_address() {
+    local MAC_ADDRESS="$1"
 
     # Validate MAC address format
-    if [[ ! "${mac_address}" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
-        log_error "Invalid MAC address format: ${mac_address}"
+    if [[ ! "${MAC_ADDRESS}" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
+        log_error "Invalid MAC address format: ${MAC_ADDRESS}"
         return 1
     fi
 
@@ -1745,16 +1950,15 @@ record_mac_address() {
     # Create directory if it doesn't exist
     mkdir -p "$(dirname "${CONFIG_FILE}")"
 
-    # If config file exists, update MAC address, otherwise create new file with MAC
     if [[ -f "${CONFIG_FILE}" ]]; then
         # Remove any malformed MAC lines first
         sed -i '/^MAC=/d' "${CONFIG_FILE}"
         # Add clean MAC line
-        echo "MAC=${mac_address}" >> "${CONFIG_FILE}"
+        echo "MAC=${MAC_ADDRESS}" >> "${CONFIG_FILE}"
         log_info "Updated MAC address in existing config file"
     else
         # Create new config file with MAC address
-        echo "MAC=${mac_address}" > "${CONFIG_FILE}"
+        echo "MAC=${MAC_ADDRESS}" > "${CONFIG_FILE}"
         chmod 600 "${CONFIG_FILE}"
         chown 100000:100000 "${CONFIG_FILE}"
         log_info "Created new config file with MAC address"
@@ -1769,6 +1973,7 @@ create_vm_role() {
     local privileges=(
         # VM lifecycle management
         "VM.Allocate"       # Create/remove VMs
+        "VM.Audit"          # VM Audit
         "VM.Clone"          # Clone VMs
         "VM.Config.CDROM"   # Change CD/DVD
         "VM.Config.CPU"     # Modify CPU settings
@@ -1798,6 +2003,10 @@ create_vm_role() {
 
         # Node access for VM operations
         "Sys.Console"       # Access node console (needed for some operations)
+
+	# SDN (Software Defined Network) permissions
+        "SDN.Use"          # Use SDN zones and bridges
+        "SDN.Audit"        # View SDN configuration
     )
 
     # Join privileges with comma
