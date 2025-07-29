@@ -38,7 +38,8 @@ MEMORY=${MEMORY:-2048}
 CORES=${CORES:-2}
 ROOTFS_SIZE=${ROOTFS_SIZE:-8}
 BRIDGE=${BRIDGE:-"vmbr0"}
-HOST_PORT=${HOST_PORT:-"8071"}
+VLAN=${VLAN:-""}
+LXC_PORT=${LXC_PORT:-"8071"}
 STORAGE=${STORAGE:-""}
 TEMPLATE_STORAGE=${TEMPLATE_STORAGE:-""}
 IP_ADDRESS=${IP:-""}
@@ -48,8 +49,8 @@ IMAGE_TAG=${TAG:-"stable"}
 CONTAINER_ID_MANUAL=""
 CONFIG_FILE="/etc/quickvm/quickvm-provider.env"
 SKIP_API_USER=${SKIP_API_USER:-false}
+SKIP_NETWORK_CHECK=${SKIP_NETWORK_CHECK:-false}
 AUTO_UPDATE=${AUTO_UPDATE:-false}
-INTERFACES=${INTERFACES:-""}
 
 # API key handling
 if [[ -z "${API_KEY:-}" ]]; then
@@ -81,60 +82,6 @@ log_error() {
     echo "[ERROR] $1"
 }
 
-# Validate specified interfaces exist and have IP addresses
-validate_interfaces() {
-    if [[ -z "${INTERFACES}" ]]; then
-        return 0  # No validation needed if no interfaces specified
-    fi
-
-    log_info "Validating specified interfaces: ${INTERFACES}"
-
-    IFS=',' read -ra INTERFACE_ARRAY <<< "${INTERFACES}"
-    local INVALID_INTERFACES=()
-    local VALID_IPS=()
-
-    for INTERFACE in "${INTERFACE_ARRAY[@]}"; do
-        INTERFACE=$(echo "${INTERFACE}" | xargs)  # trim whitespace
-
-        # Check if interface exists
-        if ! ip link show "${INTERFACE}" >/dev/null 2>&1; then
-            INVALID_INTERFACES+=("${INTERFACE} (does not exist)")
-            continue
-        fi
-
-        # Check if interface has an IP address
-        local IP=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
-        if [[ -z "${IP}" ]]; then
-            INVALID_INTERFACES+=("${INTERFACE} (no IP address)")
-            continue
-        fi
-
-        VALID_IPS+=("${INTERFACE}:${IP}")
-        log_info "  ✓ ${INTERFACE}: ${IP}"
-    done
-
-    if [[ ${#INVALID_INTERFACES[@]} -gt 0 ]]; then
-        log_error "Invalid interfaces specified:"
-        for INVALID in "${INVALID_INTERFACES[@]}"; do
-            log_error "  ✗ ${INVALID}"
-        done
-        log_error ""
-        log_error "Available interfaces with IP addresses:"
-        ip addr show | grep -E '^[0-9]+:' | while read LINE; do
-            IFACE=$(echo "${LINE}" | awk -F': ' '{print $2}' | cut -d'@' -f1)
-            if [[ "${IFACE}" != "lo" ]]; then
-                    IP_LOCAL=$(ip addr show "${IFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
-                    if [[ -n "${IP_LOCAL}" ]]; then
-                        echo "    ${IFACE}: ${IP_LOCAL}"
-                    fi
-                fi
-        done
-        exit 1
-    fi
-
-    log_success "All specified interfaces are valid and have IP addresses"
-}
-
 # Parse command line arguments
 parse_arguments() {
     while [[ $# -gt 0 ]]; do
@@ -164,8 +111,12 @@ parse_arguments() {
                 BRIDGE="$2"
                 shift 2
                 ;;
+            --vlan)
+                VLAN="$2"
+                shift 2
+                ;;
             -p|--port)
-                HOST_PORT="$2"
+                LXC_PORT="$2"
                 shift 2
                 ;;
             -s|--storage)
@@ -200,6 +151,10 @@ parse_arguments() {
                 SKIP_API_USER=true
                 shift
                 ;;
+            --skip-network-check)
+                SKIP_NETWORK_CHECK=true
+                shift
+                ;;
             --auto-update)
                 # Handle optional argument (true/false)
                 if [[ $# -gt 1 && -n "${2:-}" && "$2" != -* ]]; then
@@ -222,47 +177,7 @@ parse_arguments() {
                     shift
                 fi
                 ;;
-            --interfaces)
-                INTERFACES="$2"
-                shift 2
-                ;;
-            --list-interfaces)
-                echo "Available network interfaces with IP addresses:"
-                echo ""
 
-                # Use array-based approach to avoid pipe/subshell issues
-                local INTERFACE_ARRAY=()
-                while IFS= read -r LINE; do
-                    INTERFACE_ARRAY+=("${LINE}")
-                done < <(ip addr show | grep -E '^[0-9]+:')
-
-                for LINE in "${INTERFACE_ARRAY[@]}"; do
-                    IFACE=$(echo "${LINE}" | awk -F': ' '{print $2}' | cut -d'@' -f1)
-                    if [[ "${IFACE}" != "lo" ]]; then
-                        IP_LOCAL=$(ip addr show "${IFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
-                        STATE=$(echo "${LINE}" | grep -o 'state [A-Z]*' | awk '{print $2}' || echo "UNKNOWN")
-
-                        # Check interface flags to provide more intuitive status
-                        if [[ "${STATE}" == "UNKNOWN" ]]; then
-                            FLAGS=$(echo "${LINE}" | grep -o '<[^>]*>')
-                            if [[ "${FLAGS}" =~ UP && "${FLAGS}" =~ LOWER_UP ]]; then
-                                STATE="ACTIVE"
-                            fi
-                        fi
-
-                        if [[ -n "${IP_LOCAL}" ]]; then
-                            printf "  %-15s %s (%s)\n" "${IFACE}" "${IP_LOCAL}" "${STATE}"
-                        else
-                            printf "  %-15s %s (%s)\n" "${IFACE}" "no IP" "${STATE}"
-                        fi
-                    fi
-                done
-
-                echo ""
-                echo "Use --interfaces with a comma-separated list of interface names."
-                echo "Example: --interfaces eno1,defined1"
-                exit 0
-                ;;
             -h|--help)
                 show_usage
                 exit 0
@@ -347,7 +262,7 @@ detect_cluster_config() {
     log_success "Node configuration:"
     log_success "  Node: ${CURRENT_NODE}"
     log_success "  Node ID: ${NODE_ID}"
-    log_success "  Port: ${HOST_PORT} (same port on all nodes)"
+    log_success "  Port: ${LXC_PORT} (accessible on LXC)"
 
     # Show cluster info for reference
     if [[ ${#NODES[@]} -gt 1 ]]; then
@@ -355,9 +270,9 @@ detect_cluster_config() {
         log_info "Cluster setup detected - ${#NODES[@]} nodes:"
         for I in "${!NODES[@]}"; do
             if [[ "${NODES[$I]}" == "${CURRENT_NODE}" ]]; then
-                echo "  ${NODES[$I]} (this node) - port ${HOST_PORT}"
+                echo "  ${NODES[$I]} (this node) - LXC port ${LXC_PORT}"
             else
-                echo "  ${NODES[$I]} - port ${HOST_PORT}"
+                echo "  ${NODES[$I]} - LXC port ${LXC_PORT}"
             fi
         done
         echo ""
@@ -839,6 +754,77 @@ create_host_directories() {
 
 # Create LXC container
 create_container() {
+    # Validate bridge exists and is up
+    log_info "Validating network bridge: ${BRIDGE}"
+    if ! ip link show "${BRIDGE}" >/dev/null 2>&1; then
+        log_error "Bridge ${BRIDGE} does not exist on this host"
+        log_error "Available bridges:"
+        ip link show type bridge 2>/dev/null | grep -E '^[0-9]+:' | awk -F': ' '{print "  " $2}' | cut -d'@' -f1 || log_error "  No bridges found"
+        exit 1
+    fi
+
+    # Check if bridge is up
+    local BRIDGE_STATE=$(ip link show "${BRIDGE}" | grep -oE 'state [A-Z]+' | awk '{print $2}')
+    if [[ "${BRIDGE_STATE}" != "UP" ]]; then
+        log_warning "Bridge ${BRIDGE} is in state: ${BRIDGE_STATE}"
+        log_warning "This may cause network connectivity issues"
+    fi
+
+    # Check if bridge has an IP (for DHCP scenarios)
+    local BRIDGE_IP=$(ip addr show "${BRIDGE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+    if [[ -n "${BRIDGE_IP}" ]]; then
+        log_info "Bridge ${BRIDGE} has IP: ${BRIDGE_IP}"
+    else
+        log_info "Bridge ${BRIDGE} has no IP address (may be purely L2)"
+    fi
+
+    # Validate bridge exists and is properly configured
+    if ! ip link show "${BRIDGE}" >/dev/null 2>&1; then
+        log_error "Bridge ${BRIDGE} does not exist"
+        log_error "Available bridges:"
+        ip link show type bridge 2>/dev/null | grep -E '^[0-9]+:' | awk -F': ' '{print "  " $2}' | cut -d'@' -f1
+        exit 1
+    fi
+
+    # Check if bridge is UP
+    local BRIDGE_STATE=$(ip link show "${BRIDGE}" | grep -o 'state [A-Z]*' | awk '{print $2}')
+    if [[ "${BRIDGE_STATE}" != "UP" && "${BRIDGE_STATE}" != "UNKNOWN" ]]; then
+        log_warning "Bridge ${BRIDGE} is not UP (state: ${BRIDGE_STATE})"
+        log_info "Attempting to bring bridge UP..."
+        ip link set "${BRIDGE}" up || {
+            log_error "Failed to bring bridge ${BRIDGE} up"
+            exit 1
+        }
+    fi
+
+    # Check if bridge is usable (allow both Linux bridges and OpenVSwitch)
+    local BRIDGE_TYPE="unknown"
+
+    # Check if it's a Linux bridge
+    if [[ -d "/sys/class/net/${BRIDGE}/bridge" ]]; then
+        BRIDGE_TYPE="linux"
+        log_info "Detected Linux bridge: ${BRIDGE}"
+    # Check if it's managed by OpenVSwitch
+    elif command -v ovs-vsctl >/dev/null 2>&1 && ovs-vsctl show 2>/dev/null | grep -q "Port ${BRIDGE}"; then
+        BRIDGE_TYPE="openvswitch"
+        log_info "Detected OpenVSwitch bridge: ${BRIDGE}"
+    # For Proxmox, sometimes bridges work even if not detected as standard bridges
+    else
+        log_warning "Bridge ${BRIDGE} type not clearly identified, but proceeding with container creation"
+        log_warning "If container creation fails, the bridge may not be properly configured"
+    fi
+
+    # Validate bridge can be used by containers
+    log_info "Validating bridge ${BRIDGE} for container use..."
+
+    # Check bridge configuration
+    if [[ -f "/proc/sys/net/bridge/bridge-nf-call-iptables" ]]; then
+        local BRIDGE_NF_CALL=$(cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || echo "0")
+        if [[ "${BRIDGE_NF_CALL}" != "1" ]]; then
+            log_warning "Bridge netfilter may not be enabled (bridge-nf-call-iptables=${BRIDGE_NF_CALL})"
+        fi
+    fi
+
     # Get MAC address for container
     local MAC_ADDRESS=$(get_mac_address)
 
@@ -857,9 +843,21 @@ create_container() {
     local NET_CONFIG=""
     # Create container with dynamic network configuration
     if [[ -n "${IP_ADDRESS}" && -n "${GATEWAY}" ]]; then
-        NET_CONFIG="name=eth0,bridge=${BRIDGE},gw=${GATEWAY},ip=${IP_ADDRESS},firewall=1,hwaddr=${MAC_ADDRESS}"
+        if [[ -n "${VLAN}" ]]; then
+            log_info "Creating container with static IP: ${IP_ADDRESS}, Gateway: ${GATEWAY}, VLAN: ${VLAN}"
+            NET_CONFIG="name=eth0,bridge=${BRIDGE},gw=${GATEWAY},ip=${IP_ADDRESS},tag=${VLAN},firewall=1,hwaddr=${MAC_ADDRESS}"
+        else
+            log_info "Creating container with static IP: ${IP_ADDRESS}, Gateway: ${GATEWAY}"
+            NET_CONFIG="name=eth0,bridge=${BRIDGE},gw=${GATEWAY},ip=${IP_ADDRESS},firewall=1,hwaddr=${MAC_ADDRESS}"
+        fi
     else
-        NET_CONFIG="name=eth0,bridge=${BRIDGE},firewall=1,hwaddr=${MAC_ADDRESS}"
+        if [[ -n "${VLAN}" ]]; then
+            log_info "Creating container with DHCP networking and VLAN: ${VLAN}"
+            NET_CONFIG="name=eth0,bridge=${BRIDGE},tag=${VLAN},firewall=1,hwaddr=${MAC_ADDRESS}"
+        else
+            log_info "Creating container with DHCP networking"
+            NET_CONFIG="name=eth0,bridge=${BRIDGE},firewall=1,hwaddr=${MAC_ADDRESS}"
+        fi
     fi
 
     # Create container with bridged networking
@@ -898,21 +896,137 @@ start_container() {
     log_info "Waiting for container to be ready..."
     sleep 10
 
-    # Wait for network to be available
+    # Skip network check if requested
+    if [[ "${SKIP_NETWORK_CHECK}" == "true" ]]; then
+        log_warning "Skipping network interface check (--skip-network-check enabled)"
+        log_success "Container started (network check bypassed)"
+        return 0
+    fi
+
+    # Wait for network interface to be up and have an IP
     local MAX_ATTEMPTS=30
     local ATTEMPT=1
+    local INTERFACE_READY=false
 
-    while ! pct exec "${CONTAINER_ID}" -- ping -c 1 8.8.8.8 &>/dev/null; do
+    log_info "Checking container network interface..."
+    while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
+        # Check if container has a network interface with IP (not just eth0)
+        local CONTAINER_HAS_IP=$(pct exec "${CONTAINER_ID}" -- ip addr show 2>/dev/null | grep -E 'inet [0-9]+\.' | grep -v '127.0.0.1' | head -n1 || true)
+
+        if [[ -n "${CONTAINER_HAS_IP}" ]]; then
+            INTERFACE_READY=true
+            log_success "Container network interface is ready"
+            break
+        fi
+
+        # Add debugging output every 10 attempts
+        if [[ $((ATTEMPT % 10)) -eq 0 ]]; then
+            log_info "Debug: Container network status at attempt $ATTEMPT:"
+            pct exec "${CONTAINER_ID}" -- ip link show 2>/dev/null || log_warning "Failed to get link status"
+            pct exec "${CONTAINER_ID}" -- ip addr show 2>/dev/null || log_warning "Failed to get addr status"
+            log_info "Debug: Container network configuration:"
+            pct config "${CONTAINER_ID}" | grep -E "^net" || log_warning "No network config found"
+            log_info "Debug: Host bridge status for configured bridge:"
+            ip link show "${BRIDGE}" 2>/dev/null || log_warning "Bridge ${BRIDGE} not found on host"
+
+            # Check if we're using DHCP and suggest static IP
+            if [[ -z "${IP_ADDRESS}" || -z "${GATEWAY}" ]]; then
+                log_warning "Container is configured for DHCP but no IP received"
+                log_warning "If DHCP is not available, use static IP configuration:"
+                if [[ -n "${VLAN}" ]]; then
+                    log_warning "  --ip-address <IP/CIDR> --gateway <GATEWAY_IP> --vlan ${VLAN}"
+                    log_warning "  Example: --ip-address 192.168.1.100/24 --gateway 192.168.1.1 --vlan ${VLAN}"
+                else
+                    log_warning "  --ip-address <IP/CIDR> --gateway <GATEWAY_IP>"
+                    log_warning "  Example: --ip-address 192.168.1.100/24 --gateway 192.168.1.1"
+                fi
+            fi
+        fi
+
         if [[ $ATTEMPT -ge $MAX_ATTEMPTS ]]; then
-            log_error "Container network not ready after ${MAX_ATTEMPTS} attempts"
+            log_error "Container network interface not ready after ${MAX_ATTEMPTS} attempts"
+
+            # Provide specific guidance based on network configuration
+            if [[ -z "${IP_ADDRESS}" || -z "${GATEWAY}" ]]; then
+                log_error ""
+                log_error "DHCP CONFIGURATION DETECTED - This may be the issue!"
+                log_error ""
+                log_error "If this Proxmox node doesn't support DHCP, you need to use static IP:"
+                if [[ -n "${VLAN}" ]]; then
+                    log_error "  sudo ./quickvm-proxmox-provider.sh \\"
+                    log_error "    --ip-address <IP/CIDR> \\"
+                    log_error "    --gateway <GATEWAY_IP> \\"
+                    log_error "    --vlan ${VLAN}"
+                    log_error ""
+                    log_error "Example:"
+                    log_error "  sudo ./quickvm-proxmox-provider.sh \\"
+                    log_error "    --ip-address 192.168.1.100/24 \\"
+                    log_error "    --gateway 192.168.1.1 \\"
+                    log_error "    --vlan ${VLAN}"
+                else
+                    log_error "  sudo ./quickvm-proxmox-provider.sh \\"
+                    log_error "    --ip-address <IP/CIDR> \\"
+                    log_error "    --gateway <GATEWAY_IP>"
+                    log_error ""
+                    log_error "Example:"
+                    log_error "  sudo ./quickvm-proxmox-provider.sh \\"
+                    log_error "    --ip-address 192.168.1.100/24 \\"
+                    log_error "    --gateway 192.168.1.1"
+                fi
+                log_error ""
+                log_error "To find your network details:"
+                log_error "  ip route show default  # Shows gateway"
+                log_error "  ip addr show ${BRIDGE}     # Shows bridge IP range"
+            else
+                log_error "Static IP configuration detected but container still has no IP"
+                log_error "Check if IP ${IP_ADDRESS} conflicts with existing assignments"
+            fi
+
+            log_error ""
+            log_error "Final debug - Container network interfaces:"
+            pct exec "${CONTAINER_ID}" -- ip addr show 2>/dev/null || log_error "Cannot execute ip addr in container"
+            log_error "Container network configuration:"
+            pct config "${CONTAINER_ID}" | grep -E "^net" || log_error "No network config in container"
+            log_error "Host bridge ${BRIDGE} status:"
+            ip addr show "${BRIDGE}" 2>/dev/null || log_error "Bridge ${BRIDGE} not available"
             exit 1
         fi
-        log_info "Waiting for network... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+        log_info "Waiting for network interface... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
         sleep 2
         ((ATTEMPT++))
     done
 
-    log_success "Container started and network is ready"
+    # Test network connectivity (try gateway first, then internet)
+    if [[ $INTERFACE_READY == true ]]; then
+        log_info "Testing network connectivity..."
+        ATTEMPT=1
+        local CONNECTIVITY_OK=false
+
+        while [[ $ATTEMPT -le 15 ]]; do  # Reduced attempts for connectivity test
+            # Try to ping the gateway first
+            local GATEWAY=$(pct exec "${CONTAINER_ID}" -- ip route show default 2>/dev/null | awk '{print $3}' | head -n1 || true)
+            if [[ -n "${GATEWAY}" ]] && pct exec "${CONTAINER_ID}" -- ping -c 1 -W 2 "${GATEWAY}" &>/dev/null; then
+                log_success "Container can reach gateway (${GATEWAY})"
+                CONNECTIVITY_OK=true
+                break
+            elif pct exec "${CONTAINER_ID}" -- ping -c 1 -W 2 8.8.8.8 &>/dev/null; then
+                log_success "Container has internet connectivity"
+                CONNECTIVITY_OK=true
+                break
+            fi
+
+            log_info "Testing connectivity... (attempt $ATTEMPT/15)"
+            sleep 2
+            ((ATTEMPT++))
+        done
+
+        if [[ $CONNECTIVITY_OK == false ]]; then
+            log_warning "Container network interface is up but connectivity test failed"
+            log_warning "This may be expected if the container is on an isolated network"
+        fi
+    fi
+
+    log_success "Container started and network interface is ready"
 }
 
 # Update system and install packages
@@ -936,16 +1050,47 @@ setup_container_packages() {
 configure_firewall() {
     log_info "Configuring firewall..."
 
-    # Open port 8071
-    pct exec "${CONTAINER_ID}" -- firewall-cmd --permanent --add-port=${HOST_PORT}/tcp
+    # Open port for the LXC service from any source (0.0.0.0/0)
+    pct exec "${CONTAINER_ID}" -- firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='0.0.0.0/0' port protocol='tcp' port='${LXC_PORT}' accept"
     pct exec "${CONTAINER_ID}" -- firewall-cmd --reload
 
-    log_success "Firewall configured - port ${HOST_PORT} opened"
+    log_success "Firewall configured - port ${LXC_PORT} opened for access from 0.0.0.0/0"
+}
+
+# Configure LXC firewall
+configure_lxc_firewall() {
+    log_info "Configuring LXC firewall for container ${CONTAINER_ID}..."
+
+    # Create LXC firewall configuration file
+    local LXC_FW_FILE="/etc/pve/firewall/${CONTAINER_ID}.fw"
+
+    # Create firewall directory if it doesn't exist
+    mkdir -p /etc/pve/firewall
+
+    # Backup existing LXC firewall file if it exists
+    if [[ -f "${LXC_FW_FILE}" ]]; then
+        cp "${LXC_FW_FILE}" "${LXC_FW_FILE}.backup.$(date +%Y%m%d%H%M%S)"
+        log_info "Backed up existing LXC firewall configuration"
+    fi
+
+    # Create LXC firewall configuration
+    cat > "${LXC_FW_FILE}" << EOF
+[OPTIONS]
+
+enable: 1
+
+[RULES]
+
+IN ACCEPT -p tcp -dport ${LXC_PORT} -source 0.0.0.0/0 # quickvm-provider-${LXC_PORT}
+
+EOF
+
+    log_success "LXC firewall configured - port ${LXC_PORT} allowed from any source"
 }
 
 # Configure Proxmox node port access
 configure_node_access() {
-    log_info "Configuring Proxmox node access for port ${HOST_PORT}..."
+    log_info "Configuring Proxmox node firewall for port ${LXC_PORT}..."
 
     # Get container IP address for reference
     local CONTAINER_IP_LOCAL=""
@@ -953,7 +1098,8 @@ configure_node_access() {
     local ATTEMPT_LOCAL=1
 
     while [[ -z "${CONTAINER_IP_LOCAL}" && $ATTEMPT_LOCAL -le $MAX_ATTEMPTS_LOCAL ]]; do
-        CONTAINER_IP_LOCAL=$(pct exec "${CONTAINER_ID}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true)
+        # Get IP from any interface (excluding loopback)
+        CONTAINER_IP_LOCAL=$(pct exec "${CONTAINER_ID}" -- ip addr show 2>/dev/null | grep -E 'inet [0-9]+\.' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true)
         if [[ -z "${CONTAINER_IP_LOCAL}" ]]; then
             log_info "Waiting for container network... (attempt $ATTEMPT_LOCAL/$MAX_ATTEMPTS_LOCAL)"
             sleep 5
@@ -961,240 +1107,55 @@ configure_node_access() {
         fi
     done
 
-    if [[ -z "${CONTAINER_IP}" ]]; then
-        log_warning "Could not determine container IP address - skipping node access configuration"
+    if [[ -z "${CONTAINER_IP_LOCAL}" ]]; then
+        log_warning "Could not determine container IP address - skipping node firewall configuration"
         return 0
     fi
 
-    log_info "Container IP: ${CONTAINER_IP}"
+    log_info "Container IP: ${CONTAINER_IP_LOCAL}"
 
     # Create firewall directory if it doesn't exist
     mkdir -p /etc/pve/firewall
 
-    # Create node-specific firewall rules to allow access to the port
-    local NODE_FW_FILE_LOCAL="/etc/pve/nodes/${CURRENT_NODE}/host.fw"
-
-    # Backup existing firewall file if it exists
-    if [[ -f "${NODE_FW_FILE_LOCAL}" ]]; then
-        cp "${NODE_FW_FILE_LOCAL}" "${NODE_FW_FILE_LOCAL}.backup.$(date +%Y%m%d%H%M%S)"
-        log_info "Backed up existing node firewall configuration"
-    fi
-
     # Create nodes directory if it doesn't exist
     mkdir -p "/etc/pve/nodes/${CURRENT_NODE}"
 
-    # Check if our rule already exists
-    local RULE_EXISTS_LOCAL=false
-    if [[ -f "${NODE_FW_FILE_LOCAL}" ]] && grep -q "quickvm-provider-${HOST_PORT}" "${NODE_FW_FILE_LOCAL}"; then
-        RULE_EXISTS_LOCAL=true
-    fi
+    log_info "Configuring node firewall to allow access to port ${LXC_PORT}"
 
-    log_info "Configuring node firewall to allow access to port ${HOST_PORT}"
+    # Clean up any existing quickvm rules for this port using Proxmox API
+    local EXISTING_RULES=$(pvesh get /nodes/${CURRENT_NODE}/firewall/rules --output-format json 2>/dev/null || echo "[]")
+    if [[ "${EXISTING_RULES}" != "[]" ]]; then
+        # Find and delete existing quickvm rules (search by comment or port)
+        local RULES_TO_DELETE=$(echo "${EXISTING_RULES}" | jq -r --arg PORT "${LXC_PORT}" '.[] | select(.comment == "quickvm-provider-" + $PORT or (.dport == $PORT and .action == "ACCEPT" and .type == "in" and .proto == "tcp")) | .pos' 2>/dev/null || true)
 
-    # Create or update the firewall configuration
-    if [[ "${RULE_EXISTS_LOCAL}" == "true" ]]; then
-        # Update existing rule by removing old one and adding new one
-        sed -i "/# quickvm-provider-${HOST_PORT}/,+1d" "${NODE_FW_FILE_LOCAL}"
-    fi
-
-    # Add the node access rule
-    {
-        if [[ ! -f "${NODE_FW_FILE}" ]] || ! grep -q "^\[OPTIONS\]" "${NODE_FW_FILE}"; then
-            echo "[OPTIONS]"
-            echo "enable: 1"
-            echo ""
+        if [[ -n "${RULES_TO_DELETE}" ]]; then
+            # Delete rules in reverse order to maintain position indices
+            echo "${RULES_TO_DELETE}" | sort -nr | while read -r POS; do
+                if [[ -n "${POS}" ]]; then
+                    log_info "Removing existing firewall rule at position ${POS}"
+                    pvesh delete /nodes/${CURRENT_NODE}/firewall/rules/${POS} 2>/dev/null || true
+                fi
+            done
         fi
-
-        if ! grep -q "^\[RULES\]" "${NODE_FW_FILE}" 2>/dev/null; then
-            echo "[RULES]"
-        fi
-
-        echo "# quickvm-provider-${HOST_PORT}"
-        echo "IN ACCEPT -p tcp --dport ${HOST_PORT} -source +management"
-    } >> "${NODE_FW_FILE}"
-
-    # Setup port forwarding using iptables (persistent approach)
-    log_info "Setting up persistent port forwarding..."
-
-    # Create a helper script that reads config dynamically
-    cat > "/usr/local/bin/quickvm-port-forward.sh" << 'EOF'
-#!/bin/bash
-# QuickVM Port Forwarding Helper Script
-# Reads configuration from container environment and sets up iptables rules
-
-CONFIG_FILE="/etc/quickvm/quickvm-provider.env"
-CONTAINER_NAME="quickvm-provider"
-
-# Function to get container IP
-get_container_ip() {
-    local CONTAINER_ID_LOCAL=$(pct list | grep "${CONTAINER_NAME}" | awk '{print $1}' | head -n1)
-    if [[ -n "${CONTAINER_ID_LOCAL}" ]]; then
-        pct exec "${CONTAINER_ID_LOCAL}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true
     fi
-}
 
-# Function to read port from config
-get_port() {
-    if [[ -f "${CONFIG_FILE}" ]]; then
-        grep "^PORT=" "${CONFIG_FILE}" | cut -d'=' -f2 | tr -d ' '
+    # Add the new firewall rule using Proxmox API with source 0.0.0.0/0
+    log_info "Adding firewall rule for port ${LXC_PORT} from source 0.0.0.0/0"
+    if pvesh create /nodes/${CURRENT_NODE}/firewall/rules -action ACCEPT -type in -dport ${LXC_PORT} -proto tcp -source "0.0.0.0/0" -comment "quickvm-provider-${LXC_PORT}" -enable 1 2>/dev/null; then
+        log_success "Firewall rule added successfully for source 0.0.0.0/0"
     else
-        echo "8071"  # Default fallback
+        log_warning "Failed to add firewall rule via API, firewall may need manual configuration"
     fi
-}
-
-# Function to get IPs from specified interfaces or auto-detect
-get_forwarding_ips() {
-    local INTERFACES=""
-
-    # Read interfaces from config file
-    if [[ -f "${CONFIG_FILE}" ]]; then
-        INTERFACES=$(grep "^INTERFACES=" "${CONFIG_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d ' ' || true)
-    fi
-
-    # If no interfaces specified, use legacy behavior (vmbr0 or hostname -I)
-    if [[ -z "${INTERFACES}" ]]; then
-        local CLUSTER_IP=$(pvesh get /nodes/$(hostname)/network --output-format json 2>/dev/null | \
-            jq -r '.[] | select(.iface == "vmbr0" and .address != null) | .address' 2>/dev/null | head -n1)
-
-        if [[ -z "${CLUSTER_IP}" || "${CLUSTER_IP}" == "null" ]]; then
-            CLUSTER_IP=$(hostname -I | awk '{print $1}')
-        fi
-
-        echo "${CLUSTER_IP}"
-        return
-    fi
-
-    # Get IPs from specified interfaces
-    local IP_LIST_LOCAL=""
-    IFS=',' read -ra INTERFACE_ARRAY <<< "${INTERFACES}"
-    for INTERFACE in "${INTERFACE_ARRAY[@]}"; do
-        INTERFACE=$(echo "${INTERFACE}" | xargs)  # trim whitespace
-        local IP_LOCAL=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
-        if [[ -n "${IP_LOCAL}" ]]; then
-            if [[ -n "${IP_LIST_LOCAL}" ]]; then
-                IP_LIST_LOCAL="${IP_LIST_LOCAL} ${IP_LOCAL}"
-            else
-                IP_LIST_LOCAL="${IP_LOCAL}"
-            fi
-        fi
-    done
-    echo "${IP_LIST_LOCAL}"
-}
-
-# Get current values
-CONTAINER_IP=$(get_container_ip)
-PORT=$(get_port)
-FORWARDING_IPS=$(get_forwarding_ips)
-
-if [[ -z "${CONTAINER_IP}" ]]; then
-    echo "Error: Could not determine container IP address"
-    exit 1
-fi
-
-if [[ -z "${PORT}" ]]; then
-    echo "Error: Could not determine port from configuration"
-    exit 1
-fi
-
-if [[ -z "${FORWARDING_IPS}" ]]; then
-    echo "Error: Could not determine forwarding IP addresses"
-    exit 1
-fi
-
-echo "Setting up port forwarding: ${FORWARDING_IPS}:${PORT} -> ${CONTAINER_IP}:${PORT}"
-
-case "$1" in
-    start)
-        # Add DNAT rules for each forwarding IP
-        IFS=',' read -ra IP_ARRAY <<< "${FORWARDING_IPS}"
-        for IP in "${IP_ARRAY[@]}"; do
-            IP=$(echo "${IP}" | xargs)  # trim whitespace
-            echo "Adding forwarding rule for ${IP}:${PORT} -> ${CONTAINER_IP}:${PORT}"
-
-            # Add DNAT rule scoped to this IP if it doesn't exist
-            iptables -t nat -C PREROUTING -d "${IP}" -p tcp --dport "${PORT}" -j DNAT --to-destination "${CONTAINER_IP}:${PORT}" 2>/dev/null || \
-            iptables -t nat -A PREROUTING -d "${IP}" -p tcp --dport "${PORT}" -j DNAT --to-destination "${CONTAINER_IP}:${PORT}"
-        done
-
-        # Add MASQUERADE rule if it doesn't exist (only need one)
-        iptables -t nat -C POSTROUTING -p tcp -d "${CONTAINER_IP}" --dport "${PORT}" -j MASQUERADE 2>/dev/null || \
-        iptables -t nat -A POSTROUTING -p tcp -d "${CONTAINER_IP}" --dport "${PORT}" -j MASQUERADE
-        ;;
-    stop)
-        # Remove rules for each forwarding IP
-        IFS=',' read -ra IP_ARRAY <<< "${FORWARDING_IPS}"
-        for IP in "${IP_ARRAY[@]}"; do
-            IP=$(echo "${IP}" | xargs)  # trim whitespace
-            echo "Removing forwarding rule for ${IP}:${PORT} -> ${CONTAINER_IP}:${PORT}"
-
-            # Remove DNAT rule (ignore errors if rules don't exist)
-            iptables -t nat -D PREROUTING -d "${IP}" -p tcp --dport "${PORT}" -j DNAT --to-destination "${CONTAINER_IP}:${PORT}" 2>/dev/null || true
-        done
-
-        # Remove MASQUERADE rule (ignore errors if rule doesn't exist)
-        iptables -t nat -D POSTROUTING -p tcp -d "${CONTAINER_IP}" --dport "${PORT}" -j MASQUERADE 2>/dev/null || true
-        ;;
-    *)
-        echo "Usage: ${0} {start|stop}"
-        exit 1
-        ;;
-esac
-EOF
-
-    # Make the script executable
-    chmod +x "/usr/local/bin/quickvm-port-forward.sh"
-
-    # Create a systemd service for port forwarding
-    cat > "/etc/systemd/system/quickvm-port-forward.service" << EOF
-[Unit]
-Description=QuickVM Port Forwarding
-After=network.target pve-firewall.service
-Requires=pve-firewall.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/quickvm-port-forward.sh start
-ExecStop=/usr/local/bin/quickvm-port-forward.sh stop
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # Enable and start the port forwarding service
-    systemctl daemon-reload
-    systemctl enable "quickvm-port-forward.service"
-    systemctl start "quickvm-port-forward.service"
 
     # Reload Proxmox firewall
     if command -v pve-firewall >/dev/null; then
         log_info "Reloading Proxmox firewall..."
         if pve-firewall compile 2>/dev/null; then
             systemctl reload pve-firewall
-            log_success "Node access configured for port ${HOST_PORT}"
-
-            # Show which interfaces are being used for port forwarding
-            if [[ -n "${INTERFACES}" ]]; then
-                # Get the actual IPs for the specified interfaces
-                local FORWARDING_DETAILS_LOCAL=""
-                IFS=',' read -ra INTERFACE_ARRAY <<< "${INTERFACES}"
-                for INTERFACE in "${INTERFACE_ARRAY[@]}"; do
-                    INTERFACE=$(echo "${INTERFACE}" | xargs)  # trim whitespace
-                    local IP_LOCAL=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
-                    if [[ -n "${IP_LOCAL}" ]]; then
-                        if [[ -n "${FORWARDING_DETAILS_LOCAL}" ]]; then
-                            FORWARDING_DETAILS_LOCAL="${FORWARDING_DETAILS_LOCAL}, ${INTERFACE}:${IP_LOCAL}"
-                        else
-                            FORWARDING_DETAILS_LOCAL="${INTERFACE}:${IP_LOCAL}"
-                        fi
-                    fi
-                done
-                log_success "Port forwarding active on specified interfaces: ${FORWARDING_DETAILS}:${HOST_PORT} -> ${CONTAINER_IP}:${HOST_PORT}"
-            else
-                log_success "Port forwarding active: ${CURRENT_NODE}:${HOST_PORT} -> ${CONTAINER_IP}:${HOST_PORT}"
-            fi
+            log_success "Node firewall configured for port ${LXC_PORT}"
+            log_success "LXC service accessible at: ${CONTAINER_IP_LOCAL}:${LXC_PORT}"
         else
-            log_warning "Firewall compilation had warnings - but port forwarding should still work"
+            log_warning "Firewall compilation had warnings - but access should still work"
         fi
     else
         log_warning "pve-firewall command not found - manual firewall reload may be required"
@@ -1240,13 +1201,13 @@ update_environment_for_host_network() {
 
                 # Update PORT if it doesn't exist
                 if ! grep -q '^PORT=' /etc/quickvm/quickvm-provider.env; then
-                    echo 'PORT=${HOST_PORT}' >> /etc/quickvm/quickvm-provider.env
+                    echo 'PORT=${LXC_PORT}' >> /etc/quickvm/quickvm-provider.env
                 fi
 
-                # Update INTERFACES if specified
-                if [[ -n '${INTERFACES}' ]]; then
-                    sed -i '/^INTERFACES=/d' /etc/quickvm/quickvm-provider.env
-                    echo 'INTERFACES=${INTERFACES}' >> /etc/quickvm/quickvm-provider.env
+                # Update VLAN if specified
+                if [[ -n '${VLAN}' ]]; then
+                    sed -i '/^VLAN=/d' /etc/quickvm/quickvm-provider.env
+                    echo 'VLAN=${VLAN}' >> /etc/quickvm/quickvm-provider.env
                 fi
             "
         fi
@@ -1286,16 +1247,16 @@ ENVIRONMENT=production
 WORKERS=4
 TLS_GENERATE_SELF_SIGNED=true
 TLS_CERT_SUBJECT=/C=US/ST=IL/L=Chicago/O=QuickVM/CN=quickvm-provider
-PORT=${HOST_PORT}
+PORT=${LXC_PORT}
 MAC=${CURRENT_MAC}
 EOF"
 
-        # Add INTERFACES line separately if specified
-        if [[ -n "${INTERFACES}" ]]; then
-            pct exec "${CONTAINER_ID}" -- bash -c "echo 'INTERFACES=${INTERFACES}' >> /etc/quickvm/quickvm-provider.env"
+        # Add VLAN line separately if specified
+        if [[ -n "${VLAN}" ]]; then
+            pct exec "${CONTAINER_ID}" -- bash -c "echo 'VLAN=${VLAN}' >> /etc/quickvm/quickvm-provider.env"
         fi
 
-        if [[ -n "${EXISTING_API_KEY}" ]]; then
+        if [[ -n "${EXISTING_API_KEY_LOCAL}" ]]; then
             log_info "Preserved existing API key from previous configuration"
         else
             log_info "Created environment file with new API key"
@@ -1305,7 +1266,35 @@ EOF"
     # Secure the environment file
     pct exec "${CONTAINER_ID}" -- chmod 600 /etc/quickvm/quickvm-provider.env
 
-    log_success "Environment file updated for host networking on port ${HOST_PORT}"
+    # Update host-side config file for other configuration variables
+    log_info "Updating host-side configuration file..."
+    log_info "Synchronizing with container configuration changes..."
+
+    # Always update with current values (this function is called after container config changes)
+    # Ensure config file directory exists
+    mkdir -p "$(dirname "${CONFIG_FILE}")"
+
+    # Update PORT
+    if grep -q "^PORT=" "${CONFIG_FILE}"; then
+        sed -i "s/^PORT=.*/PORT=${LXC_PORT}/" "${CONFIG_FILE}"
+    else
+        echo "PORT=${LXC_PORT}" >> "${CONFIG_FILE}"
+    fi
+
+    # Update VLAN if specified
+    if [[ -n "${VLAN}" ]]; then
+        if grep -q "^VLAN=" "${CONFIG_FILE}"; then
+            sed -i "s/^VLAN=.*/VLAN=${VLAN}/" "${CONFIG_FILE}"
+        else
+            echo "VLAN=${VLAN}" >> "${CONFIG_FILE}"
+        fi
+    fi
+
+    # Secure the config file
+    chmod 600 "${CONFIG_FILE}"
+    chown 100000:100000 "${CONFIG_FILE}"
+
+    log_success "Environment file updated for LXC networking on port ${LXC_PORT}"
 }
 
 # Create Podman Quadlet service
@@ -1325,7 +1314,7 @@ Wants=network-online.target
 [Container]
 Image=ghcr.io/quickvm/proxmox-provider/proxmox-provider:${IMAGE_TAG}
 ContainerName=quickvm-provider
-PublishPort=${HOST_PORT}:${HOST_PORT}
+PublishPort=${LXC_PORT}:${LXC_PORT}
 Volume=/etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
 Volume=/var/quickvm:/var/quickvm:Z
 Volume=/etc/quickvm/certs:/app/certs:Z
@@ -1422,8 +1411,8 @@ show_completion_info() {
     # Get container IP address
     local CONTAINER_IP_INFO=""
 
-    # Try to get container IP from pct exec
-    if CONTAINER_IP_INFO=$(pct exec "${CONTAINER_ID}" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true) && [[ -n "${CONTAINER_IP_INFO}" ]]; then
+    # Try to get container IP from pct exec (any interface excluding loopback)
+    if CONTAINER_IP_INFO=$(pct exec "${CONTAINER_ID}" -- ip addr show 2>/dev/null | grep -E 'inet [0-9]+\.' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -n1 2>/dev/null || true) && [[ -n "${CONTAINER_IP_INFO}" ]]; then
         log_info "Container has IP address: ${CONTAINER_IP_INFO}"
     else
         log_warning "Could not determine container IP address"
@@ -1435,37 +1424,19 @@ show_completion_info() {
     echo ""
     echo "Container ID: ${CONTAINER_ID}"
     echo "Container Name: ${CONTAINER_NAME}"
-    echo "Container IP: ${CONTAINER_IP}"
-    echo "MAC Address: ${STORED_MAC}"
+    echo "Container IP: ${CONTAINER_IP_INFO}"
+    local STORED_MAC=$(read_existing_mac)
+    echo "MAC Address: ${STORED_MAC:-unknown}"
+    echo "Bridge: ${BRIDGE}"
+    if [[ -n "${VLAN}" ]]; then
+        echo "VLAN: ${VLAN}"
+    fi
     echo "Node: ${CURRENT_NODE}"
     echo "Node ID: ${NODE_ID}"
-    echo "Service URL (via container): https://${CONTAINER_IP}:${HOST_PORT}"
-
-    # Show interface-specific URLs if interfaces are configured
-    if [[ -n "${INTERFACES}" ]]; then
-        echo ""
-        echo "Service URLs (via configured interfaces):"
-        IFS=',' read -ra INTERFACE_ARRAY <<< "${INTERFACES}"
-        for INTERFACE in "${INTERFACE_ARRAY[@]}"; do
-            INTERFACE=$(echo "${INTERFACE}" | xargs)  # trim whitespace
-            local IP_LOCAL=$(ip addr show "${INTERFACE}" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
-            if [[ -n "${IP_LOCAL}" ]]; then
-                echo "  ${INTERFACE}: https://${IP_LOCAL}:${HOST_PORT}"
-            fi
-        done
-        echo ""
-        echo "Port forwarding configured for interfaces: ${INTERFACES}"
-        echo "Service is accessible via specified interfaces and directly via container IP"
-    else
-        echo "Service URL (via Proxmox node): https://$(hostname -I | awk '{print $1}'):${HOST_PORT}"
-        echo ""
-        echo "Port forwarding configured: ${CURRENT_NODE}:${HOST_PORT} -> container:${HOST_PORT}"
-        echo "Service is accessible both directly via container IP and through the Proxmox node"
-    fi
+    echo "Service URL: https://${CONTAINER_IP_INFO}:${LXC_PORT}"
     echo ""
     echo "Test the service health endpoint:"
-    echo "  curl -s https://${CONTAINER_IP}:${HOST_PORT}/health --insecure"
-    echo "  curl -s https://$(hostname -I | awk '{print $1}'):${HOST_PORT}/health --insecure"
+    echo "  curl -s https://${CONTAINER_IP_INFO}:${LXC_PORT}/health --insecure"
     echo ""
     echo "To check service status:"
     echo "  pct exec ${CONTAINER_ID} -- systemctl status quickvm-provider.service"
@@ -1547,7 +1518,7 @@ show_completion_info() {
         echo "to ensure it receives the same IP address on each restart."
         echo ""
         echo "For a permanent IP assignment, configure your DHCP server"
-        echo "(router/firewall) to reserve IP ${CONTAINER_IP} for MAC ${STORED_MAC:-unknown}."
+        echo "(router/firewall) to reserve IP ${CONTAINER_IP_INFO} for MAC ${STORED_MAC:-unknown}."
         echo ""
     fi
 }
@@ -1603,6 +1574,7 @@ uninstall_service() {
     echo ""
     log_info "The following will NOT be removed (manual cleanup required):"
     echo "  - Host directories: /var/quickvm and /etc/quickvm"
+    echo "  - Host configuration file: ${CONFIG_FILE}"
     echo "  - Downloaded Fedora template"
     echo ""
 
@@ -1659,6 +1631,24 @@ uninstall_service() {
     fi
 
     # Process each container
+    # Clean up node firewall rules
+    log_info "Removing node firewall rules..."
+    local EXISTING_RULES=$(pvesh get /nodes/$(hostname)/firewall/rules --output-format json 2>/dev/null || echo "[]")
+    if [[ "${EXISTING_RULES}" != "[]" ]]; then
+        # Find and delete existing quickvm rules (search by comment or port)
+        local RULES_TO_DELETE=$(echo "${EXISTING_RULES}" | jq -r --arg PORT "${LXC_PORT}" '.[] | select(.comment == "quickvm-provider-" + $PORT or (.dport == $PORT and .action == "ACCEPT" and .type == "in" and .proto == "tcp")) | .pos' 2>/dev/null || true)
+
+        if [[ -n "${RULES_TO_DELETE}" ]]; then
+            # Delete rules in reverse order to maintain position indices
+            echo "${RULES_TO_DELETE}" | sort -nr | while read -r POS; do
+                if [[ -n "${POS}" ]]; then
+                    log_info "Removing firewall rule at position ${POS}"
+                    pvesh delete /nodes/$(hostname)/firewall/rules/${POS} 2>/dev/null || true
+                fi
+            done
+        fi
+    fi
+
     for CONTAINER_ID_ITEM in $CONTAINERS; do
         log_info "Processing container $CONTAINER_ID_ITEM..."
 
@@ -1679,23 +1669,7 @@ uninstall_service() {
             rm -f "${FIREWALL_FILE_LOCAL}"
         fi
 
-        # Remove node firewall rule
-        local NODE_FW_LOCAL="/etc/pve/nodes/$(hostname)/host.fw"
-        if [[ -f "${NODE_FW_LOCAL}" ]] && grep -q "quickvm-provider-${HOST_PORT}" "${NODE_FW_LOCAL}"; then
-            log_info "Removing node firewall rule..."
-            sed -i "/quickvm-provider-${HOST_PORT}/d" "${NODE_FW_LOCAL}"
-        fi
 
-        # Remove port forwarding service and helper script
-        local PORT_SERVICE="quickvm-port-forward.service"
-        if systemctl is-enabled "${PORT_SERVICE}" >/dev/null 2>&1; then
-            log_info "Removing port forwarding service..."
-            systemctl stop "${PORT_SERVICE}" 2>/dev/null || true
-            systemctl disable "${PORT_SERVICE}" 2>/dev/null || true
-            rm -f "/etc/systemd/system/${PORT_SERVICE}"
-            rm -f "/usr/local/bin/quickvm-port-forward.sh"
-            systemctl daemon-reload
-        fi
 
         log_success "Container $CONTAINER_ID_ITEM removed successfully"
     done
@@ -1714,6 +1688,8 @@ uninstall_service() {
     echo "  1. Remove host directories if no longer needed:"
     echo "     rm -rf /var/quickvm"
     echo "     rm -rf /etc/quickvm"
+    echo ""
+    echo "  NOTE: Configuration preserved at ${CONFIG_FILE} for easy reinstall"
     echo ""
     echo "  2. Remove Fedora template if no longer needed:"
     if [[ -n "$CONTAINER_STORAGE_INFO" ]]; then
@@ -1741,7 +1717,7 @@ uninstall_service() {
 
 # Main execution
 main() {
-    # Parse command line arguments first (which may exit for --list-interfaces)
+    # Parse command line arguments first
     parse_arguments "$@"
 
     echo "=== QuickVM Proxmox Provider Setup ==="
@@ -1749,9 +1725,6 @@ main() {
 
     # Validate static IP configuration
     validate_static_ip
-
-    # Validate interface configuration
-    validate_interfaces
 
     # Detect and validate storage
     detect_storage
@@ -1782,12 +1755,8 @@ main() {
     fi
     log_info "API Key: ${API_KEY}"
     log_info "Bridge: ${BRIDGE}"
-    log_info "Host Port: ${HOST_PORT}"
-    if [[ -n "${INTERFACES}" ]]; then
-        log_info "Port Forwarding Interfaces: ${INTERFACES}"
-    else
-        log_info "Port Forwarding Interfaces: auto-detect"
-    fi
+    log_info "LXC Port: ${LXC_PORT}"
+    log_info "Network: LXC direct access"
     log_info "Image Tag: ${IMAGE_TAG}"
     log_info "Auto Update: ${AUTO_UPDATE}"
     echo ""
@@ -1817,6 +1786,7 @@ main() {
     start_container
     setup_container_packages
     configure_firewall
+    configure_lxc_firewall
     configure_node_access
     update_environment_for_host_network
     create_quadlet_service
@@ -1846,14 +1816,14 @@ show_usage() {
     echo "  -g, --gateway IP         Gateway IP address (required with --ip-address)"
     echo "  -k, --api-key KEY        API key for the service (default: auto-generated 48-char key)"
     echo "  -b, --bridge NAME        Network bridge to use (default: vmbr0)"
-    echo "  -p, --port PORT          Port on Proxmox host (default: 8071)"
+    echo "  --vlan ID                VLAN ID for network interface (optional)"
+    echo "  -p, --port PORT          Port for LXC service (default: 8071)"
     echo "  -t, --tag TAG            Container image tag (default: stable)"
-    echo "      --interfaces LIST    Comma-separated list of interfaces for port forwarding (default: auto-detect)"
-    echo "      --list-interfaces    Show available network interfaces and their IP addresses"
     echo "  -h, --help               Show this help message"
     echo "      --debug              Enable debug mode (leave container on failure for debugging)"
     echo "      --debug-storage      Show storage configuration debug information and exit"
     echo "      --skip-api-user      Skip API user creation (user must be created manually)"
+    echo "      --skip-network-check Skip network interface IP validation (for troubleshooting)"
     echo "      --auto-update [true|false]  Enable/disable automatic container updates (default: disabled)"
     echo "      --uninstall          Uninstall the service and clean up resources"
     echo ""
@@ -1867,11 +1837,12 @@ show_usage() {
     echo "  GATEWAY          - Gateway IP address"
     echo "  API_KEY          - API key for the service"
     echo "  BRIDGE           - Network bridge to use"
-    echo "  HOST_PORT        - Port on Proxmox host"
+    echo "  VLAN             - VLAN ID for network interface"
+    echo "  LXC_PORT         - Port for LXC service"
     echo "  DEBUG            - Enable debug mode (true/false)"
     echo "  SKIP_API_USER    - Skip API user creation (true/false)"
-    echo "  AUTO_UPDATE      - Enable automatic container updates (true/false)"
-    echo "  INTERFACES       - Comma-separated list of interfaces for port forwarding"
+    echo "  SKIP_NETWORK_CHECK - Skip network interface IP validation (true/false)"
+    echo "  AUTO_UPDATE      - Enable automatic updates (true/false)"
     echo ""
     echo "Examples:"
     echo "  $0                                    # Use all defaults with auto-detected storage and DHCP"
@@ -1882,17 +1853,15 @@ show_usage() {
     echo "  $0 -s local-lvm --template-storage local --cpu 4  # Separate storage for containers and templates"
     echo "  $0 -k myapikey123 -b vmbr1           # Custom API key and bridge"
     echo "  $0 -t latest                         # Use latest image tag instead of default"
-    echo "  $0 --interfaces eno1,defined1        # Forward traffic only from specific interfaces"
-    echo "  $0 --list-interfaces                 # Show available network interfaces"
     echo "  $0 --debug                           # Enable debug mode (leaves container running on failure)"
     echo "  $0 --skip-api-user                   # Skip API user creation"
+    echo "  $0 --skip-network-check              # Skip network interface validation"
     echo "  $0 --auto-update                     # Enable automatic container updates (defaults to true)"
     echo "  $0 --auto-update true                # Explicitly enable automatic container updates"
     echo "  $0 --auto-update false               # Explicitly disable automatic container updates"
     echo "  IP=192.168.1.100/24 GATEWAY=192.168.1.1 $0  # Environment variables for static IP"
     echo "  TEMPLATE_STORAGE=local $0             # Use environment variable for template storage"
     echo "  AUTO_UPDATE=true $0                  # Enable auto-updates via environment variable"
-    echo "  INTERFACES=eno1,defined1 $0          # Use environment variable for interface selection"
     echo "  $0 --uninstall                       # Uninstall the service and clean up"
     echo ""
     echo "Current quickvm-provider containers:"
@@ -1953,6 +1922,7 @@ store_mac_address() {
         log_info "Updated MAC address in existing config file"
     else
         # Create new config file with MAC address
+        mkdir -p "$(dirname "${CONFIG_FILE}")"
         echo "MAC=${MAC_ADDRESS}" > "${CONFIG_FILE}"
         chmod 600 "${CONFIG_FILE}"
         chown 100000:100000 "${CONFIG_FILE}"

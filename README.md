@@ -70,6 +70,12 @@ sudo ./quickvm-proxmox-provider.sh --memory 4096 --cores 4 --disk 16
 sudo ./quickvm-proxmox-provider.sh \
   --ip-address 192.168.1.100/24 \
   --gateway 192.168.1.1
+
+# Static IP with VLAN
+sudo ./quickvm-proxmox-provider.sh \
+  --ip-address 192.168.1.100/24 \
+  --gateway 192.168.1.1 \
+  --vlan 100
 ```
 
 ## Configuration Options
@@ -87,7 +93,8 @@ sudo ./quickvm-proxmox-provider.sh \
 | `-g, --gateway IP` | `GATEWAY` | - | Gateway IP (required with static IP) |
 | `-k, --api-key KEY` | `API_KEY` | Auto-generated | API key for the service |
 | `-b, --bridge NAME` | `BRIDGE` | vmbr0 | Network bridge to use |
-| `-p, --port PORT` | `HOST_PORT` | 8071 | Host port for the service |
+| `--vlan ID` | `VLAN` | - | VLAN ID for network interface |
+| `-p, --port PORT` | `LXC_PORT` | 8071 | LXC service port |
 | `-t, --tag TAG` | - | sha-0760b32 | Container image tag |
 
 ### Special Options
@@ -117,7 +124,8 @@ sudo ./quickvm-proxmox-provider.sh \
   --disk 20 \
   --ip-address 10.0.1.50/24 \
   --gateway 10.0.1.1 \
-  --bridge vmbr1
+  --bridge vmbr1 \
+  --vlan 100
 ```
 
 ### Development Installation
@@ -161,7 +169,10 @@ sudo ./quickvm-proxmox-provider.sh \
 ### 4. Service Configuration
 - Installs required packages (Podman, systemd, etc.)
 - Creates systemd service using Quadlet
-- Configures firewall rules
+- Configures firewall rules:
+  - LXC container firewall rules
+  - Container internal firewall (firewalld)
+  - Proxmox node firewall rules
 - Starts and enables the QuickVM provider service
 
 ### 5. Resource Management
@@ -205,10 +216,22 @@ sudo ./quickvm-proxmox-provider.sh \
   --gateway 192.168.1.1
 ```
 
+### VLAN Configuration
+To place the container on a specific VLAN, use the `--vlan` option:
+```bash
+sudo ./quickvm-proxmox-provider.sh \
+  --ip-address 192.168.1.100/24 \
+  --gateway 192.168.1.1 \
+  --vlan 100
+```
+
+This is particularly useful in enterprise environments where network segmentation is required.
+
 ### Firewall
-The installation automatically configures firewall rules to allow:
-- Inbound connections on the specified port (default: 8071)
-- Required VM management operations
+The installation automatically configures firewall rules at multiple levels:
+- **LXC Container Firewall**: Allows inbound connections on the specified port (default: 8071)
+- **Container Internal Firewall** (firewalld): Opens the service port within the container
+- **Proxmox Node Firewall**: Allows access to the service port for direct LXC access
 
 ## Storage Requirements
 
@@ -284,7 +307,7 @@ This will:
 - Stop and remove the container
 - Clean up API users and roles
 - Remove host directories and configurations
-- Clean up firewall rules
+- Clean up firewall rules (LXC and node firewall rules)
 
 ## Security Considerations
 
@@ -297,6 +320,7 @@ This will:
 - Service runs on HTTPS with TLS encryption
 - Firewall rules restrict access to the service port only
 - Container isolation provides additional security boundaries
+- Service is accessible directly via LXC container IP address
 
 ### Storage Security
 - Container uses unprivileged mode by default
